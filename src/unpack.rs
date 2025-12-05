@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{MAIN_SEPARATOR, PathBuf};
+use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 
 use crate::compression::decompress_chunk;
 use crate::constants::{CHUNK_DZ, MAGIC};
@@ -201,9 +201,9 @@ pub fn do_unpack(input_path: &PathBuf, out_opt: Option<PathBuf>) -> Result<()> {
             "."
         };
 
-        let system_dir = raw_dir
-            .replace('\\', &MAIN_SEPARATOR.to_string())
-            .replace('/', &MAIN_SEPARATOR.to_string());
+        // FIX: Combine replace calls into one
+        let system_dir = raw_dir.replace(['\\', '/'], MAIN_SEPARATOR_STR);
+
         let final_dir = if system_dir == "." {
             ".".to_string()
         } else {
@@ -215,8 +215,8 @@ pub fn do_unpack(input_path: &PathBuf, out_opt: Option<PathBuf>) -> Result<()> {
         } else {
             format!(
                 "{}{}{}",
-                final_dir.trim_end_matches(MAIN_SEPARATOR),
-                MAIN_SEPARATOR,
+                final_dir.trim_end_matches(MAIN_SEPARATOR_STR),
+                MAIN_SEPARATOR_STR,
                 fname
             )
         };
@@ -233,14 +233,16 @@ pub fn do_unpack(input_path: &PathBuf, out_opt: Option<PathBuf>) -> Result<()> {
                 let reader: &mut File = if chunk.file_idx == 0 {
                     &mut main_file
                 } else {
-                    if !split_handles.contains_key(&chunk.file_idx) {
-                        let f_name = &split_file_names[(chunk.file_idx - 1) as usize];
-                        let f_path = base_dir.join(f_name);
-                        let f = File::open(&f_path)
-                            .map_err(|e| anyhow!("Missing split file {:?}: {}", f_path, e))?;
-                        split_handles.insert(chunk.file_idx, f);
+                    match split_handles.entry(chunk.file_idx) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(e) => {
+                            let f_name = &split_file_names[(chunk.file_idx - 1) as usize];
+                            let f_path = base_dir.join(f_name);
+                            let f = File::open(&f_path)
+                                .map_err(|e| anyhow!("Missing split file {:?}: {}", f_path, e))?;
+                            e.insert(f)
+                        }
                     }
-                    split_handles.get_mut(&chunk.file_idx).unwrap()
                 };
 
                 reader.seek(SeekFrom::Start(chunk.offset as u64))?;

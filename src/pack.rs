@@ -3,7 +3,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Cursor, Write};
-use std::path::{MAIN_SEPARATOR, PathBuf};
+use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 
 use crate::compression::compress_data;
 use crate::constants::{CHUNK_DZ, MAGIC};
@@ -41,12 +41,10 @@ pub fn do_pack(config_path: &PathBuf) -> Result<()> {
 
     // Process files
     for f_entry in &config.files {
-        let rel_path = f_entry
-            .path
-            .replace('\\', &MAIN_SEPARATOR.to_string())
-            .replace('/', &MAIN_SEPARATOR.to_string());
+        // FIX: Combine replace calls into one
+        let rel_path = f_entry.path.replace(['\\', '/'], MAIN_SEPARATOR_STR);
 
-        let prefix = format!(".{}", MAIN_SEPARATOR);
+        let prefix = format!(".{}", MAIN_SEPARATOR_STR);
         let clean_path = if rel_path.starts_with(&prefix) {
             &rel_path[2..]
         } else {
@@ -152,7 +150,6 @@ pub fn do_pack(config_path: &PathBuf) -> Result<()> {
     }
 
     // Chunk Settings
-    // NumArchiveFiles = 1 (main) + ext_files.len()
     let num_arch_files = 1 + config.archive_files.len() as u16;
     header_writer.write_u16::<LittleEndian>(num_arch_files)?;
     header_writer.write_u16::<LittleEndian>(config.chunks.len() as u16)?;
