@@ -1,0 +1,34 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'dz_tool'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=dz_tool"
+                ]
+            },
+            "args": [
+                "unpack",
+                "/Users/ed1th/Desktop/test/dzip/cross_promo.dz"
+            ]
+        },
+        {
+            "name": "Debug unit tests in executable 'dz_tool'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=dz_tool"
+                ]
+            }
+        }
+    ]
+}
