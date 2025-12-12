@@ -5,28 +5,25 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug executable 'dz_tool'",
+            "name": "Debug executable 'dzip_cli'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
                     "run",
-                    "--bin=dz_tool"
+                    "--bin=dzip_cli"
                 ]
             },
-            "args": [
-                "unpack",
-                "/Users/ed1th/Desktop/test/dzip/cross_promo.dz"
-            ]
+            "args": []
         },
         {
-            "name": "Debug unit tests in executable 'dz_tool'",
+            "name": "Debug unit tests in executable 'dzip_cli'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
                     "test",
-                    "--bin=dz_tool"
+                    "--bin=dzip_cli"
                 ]
             }
         }
