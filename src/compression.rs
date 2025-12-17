@@ -13,9 +13,13 @@ pub fn decompress_chunk(data: &[u8], flags: u16, expected_len: u32) -> Result<Ve
     }
 
     if flags & CHUNK_LZMA != 0 {
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(expected_len as usize);
         let mut reader = Cursor::new(data);
-        lzma_rs::lzma_decompress(&mut reader, &mut output).context("LZMA decompress failed")?;
+        let mut lzma_reader = lzma_rust2::LzmaReader::new_mem_limit(&mut reader, u32::MAX, None)
+            .map_err(|e| anyhow!("Failed to initialize LZMA reader: {}", e))?;
+        lzma_reader
+            .read_to_end(&mut output)
+            .context("LZMA decompress failed")?;
         return Ok(output);
     }
 
@@ -49,8 +53,17 @@ pub fn compress_data(data: &[u8], flags: u16) -> Result<Vec<u8>> {
 
     if flags & CHUNK_LZMA != 0 {
         let mut output = Vec::new();
-        let mut reader = Cursor::new(data);
-        lzma_rs::lzma_compress(&mut reader, &mut output)?;
+        let writer = Cursor::new(&mut output);
+        let options = lzma_rust2::LzmaOptions::default();
+        let mut lzma_writer: lzma_rust2::LzmaWriter<Cursor<&mut Vec<u8>>> =
+            lzma_rust2::LzmaWriter::new_use_header(writer, &options, None)
+                .context("Failed to initialize LZMA writer")?;
+        lzma_writer
+            .write_all(data)
+            .context("LZMA compress write failed")?;
+        lzma_writer
+            .finish()
+            .context("LZMA compress finish failed")?;
         return Ok(output);
     }
 

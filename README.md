@@ -9,7 +9,7 @@ It is designed to provide robust and accurate parsing capabilities, specifically
   * **Full Unpacking**: Restores original directory structures and files from `.dz` archives to your local disk.
   * **High-Precision Packing**: Repacks resources into compliant `.dz` files based on auto-generated TOML configuration files.
   * **Extensive Compression Support**:
-      * ✅ **LZMA** (Smart handling of standard 13-byte headers)
+      * ✅ **LZMA** (Legacy format of standard 13-byte headers)
       * ✅ **ZLIB** (Deflate)
       * ✅ **BZIP2**
       * ✅ **COPY** (Store / No compression)
