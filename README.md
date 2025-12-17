@@ -17,7 +17,7 @@ It is designed to provide robust and accurate parsing capabilities, specifically
   * **Split Archives**: Automatically identifies, reads, and writes multi-volume archives (e.g., `data.dz`, `data.d01`, `data.d02`...).
   * **Smart Fixes**:
       * **ZSIZE Correction**: Automatically calculates real compressed sizes from offsets, fixing issues where the header reports incorrect sizes.
-      * **Directory Restoration**: Handles the implicit root directory (`.`) logic specific to Marmalade archives.
+      * **Directory Restoration**: Handles the implicit root directory logic specific to Marmalade archives.
       * **Cross-Platform Compatibility**: Automatically converts between Windows (`\`) and Unix (`/`) path separators during unpack/pack operations.
 
 ## 🛠️ Installation & Build

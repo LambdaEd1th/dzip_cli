@@ -35,8 +35,8 @@ pub fn do_unpack(input_path: &PathBuf, out_opt: Option<PathBuf>) -> Result<()> {
     }
 
     let mut directories = Vec::new();
-    // Rule: First directory is implicit "."
-    directories.push(".".to_string());
+    // Rule: First directory is implicit ""
+    directories.push("".to_string());
     for _ in 0..(num_dirs - 1) {
         directories.push(read_null_term_string(&mut main_file)?);
     }
@@ -198,19 +198,19 @@ pub fn do_unpack(input_path: &PathBuf, out_opt: Option<PathBuf>) -> Result<()> {
         let raw_dir = if entry.dir_idx < directories.len() {
             &directories[entry.dir_idx]
         } else {
-            "."
+            ""
         };
 
         // FIX: Combine replace calls into one
         let system_dir = raw_dir.replace(['\\', '/'], MAIN_SEPARATOR_STR);
 
-        let final_dir = if system_dir == "." {
-            ".".to_string()
+        let final_dir = if system_dir.is_empty() {
+            "".to_string()
         } else {
             system_dir
         };
 
-        let rel_path = if final_dir == "." {
+        let rel_path = if final_dir.is_empty() {
             fname.clone()
         } else {
             format!(

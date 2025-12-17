@@ -89,19 +89,19 @@ pub fn do_pack(config_path: &PathBuf) -> Result<()> {
     let mut unique_dirs = HashSet::new();
     for f in &config.files {
         let d = f.directory.trim();
-        if d == "." || d.is_empty() {
-            unique_dirs.insert(".".to_string());
+        if d.is_empty() {
+            unique_dirs.insert("".to_string());
         } else {
             unique_dirs.insert(d.replace('\\', "/"));
         }
     }
-    if !unique_dirs.contains(".") {
-        unique_dirs.insert(".".to_string());
+    if !unique_dirs.contains("") {
+        unique_dirs.insert("".to_string());
     }
 
-    let mut sorted_dirs: Vec<String> = unique_dirs.into_iter().filter(|d| d != ".").collect();
+    let mut sorted_dirs: Vec<String> = unique_dirs.into_iter().filter(|d| !d.is_empty()).collect();
     sorted_dirs.sort();
-    sorted_dirs.insert(0, ".".to_string());
+    sorted_dirs.insert(0, "".to_string());
 
     let dir_map: HashMap<String, usize> = sorted_dirs
         .iter()
@@ -125,7 +125,7 @@ pub fn do_pack(config_path: &PathBuf) -> Result<()> {
         header_writer.write_u8(0)?;
     }
 
-    // Strings: Dirs (Skip index 0 ".")
+    // Strings: Dirs (Skip index 0 "")
     for d in sorted_dirs.iter().skip(1) {
         let win_path = d.replace('/', "\\");
         header_writer.write_all(win_path.as_bytes())?;
@@ -134,8 +134,8 @@ pub fn do_pack(config_path: &PathBuf) -> Result<()> {
 
     // Mapping Table
     for f in &config.files {
-        let d_key = if f.directory.is_empty() || f.directory == "." {
-            "."
+        let d_key = if f.directory.is_empty() {
+            ""
         } else {
             &f.directory
         }
