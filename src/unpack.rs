@@ -4,6 +4,7 @@ use log::{info, warn};
 use std::collections::{HashMap, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+// [Fix] Import MAIN_SEPARATOR_STR to adapt path separators for the current OS ( \ for Windows, / for Unix)
 use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 
 use crate::compression::CodecRegistry;
@@ -18,6 +19,7 @@ pub fn do_unpack(
     keep_raw: bool,
     registry: &CodecRegistry,
 ) -> Result<()> {
+    // Open the main archive file
     let main_file_raw = File::open(input_path)
         .map_err(DzipError::Io)
         .context(format!("Failed to open main archive: {:?}", input_path))?;
@@ -39,17 +41,20 @@ pub fn do_unpack(
         version, num_files, num_dirs
     );
 
+    // 2. Read String Table (Filenames)
     let mut user_files = Vec::new();
     for _ in 0..num_files {
         user_files.push(read_null_term_string(&mut main_file)?);
     }
 
+    // Read String Table (Directories)
     let mut directories = Vec::new();
     directories.push(".".to_string());
     for _ in 0..(num_dirs - 1) {
         directories.push(read_null_term_string(&mut main_file)?);
     }
 
+    // 3. Read Mapping Table
     struct FileMapEntry {
         id: usize,
         dir_idx: usize,
@@ -73,6 +78,7 @@ pub fn do_unpack(
         });
     }
 
+    // 4. Read Chunk Settings
     let num_arch_files = main_file.read_u16::<LittleEndian>()?;
     let num_chunks = main_file.read_u16::<LittleEndian>()?;
     info!(
@@ -80,15 +86,16 @@ pub fn do_unpack(
         num_chunks, num_arch_files
     );
 
+    // 5. Read Chunk List
     #[derive(Clone)]
     struct RawChunk {
         id: u16,
         offset: u32,
-        _head_c_len: u32,
+        _head_c_len: u32, // Head compressed length (might be inaccurate in old archives)
         d_len: u32,
         flags: u16,
         file_idx: u16,
-        real_c_len: u32,
+        real_c_len: u32, // Calculated real compressed length
     }
     let mut chunks = Vec::new();
     let mut has_dz_chunk = false;
@@ -116,6 +123,7 @@ pub fn do_unpack(
         });
     }
 
+    // 6. Read Split Filenames
     let mut split_file_names = Vec::new();
     if num_arch_files > 1 {
         info!("Reading {} split archive filenames...", num_arch_files - 1);
@@ -124,6 +132,7 @@ pub fn do_unpack(
         }
     }
 
+    // 7. Read RangeSettings (if DZ chunk exists)
     let mut range_settings_opt = None;
     if has_dz_chunk {
         info!("Detected CHUNK_DZ, reading RangeSettings...");
@@ -141,15 +150,18 @@ pub fn do_unpack(
         });
     }
 
-    // --- ZSIZE Correction ---
+    // --- ZSIZE Correction (Calculate real compressed size) ---
     let base_dir = input_path.parent().unwrap_or(std::path::Path::new("."));
     let mut file_chunks_map: HashMap<u16, Vec<usize>> = HashMap::new();
     for (idx, c) in chunks.iter().enumerate() {
         file_chunks_map.entry(c.file_idx).or_default().push(idx);
     }
+
     for (f_idx, c_indices) in file_chunks_map.iter() {
         let mut sorted_indices = c_indices.clone();
         sorted_indices.sort_by_key(|&i| chunks[i].offset);
+
+        // Get the size of the current archive part (main or split)
         let current_file_size = if *f_idx == 0 {
             main_file_len
         } else {
@@ -165,6 +177,8 @@ pub fn do_unpack(
                 })?
                 .len()
         };
+
+        // Calculate chunk size by subtracting offsets
         for k in 0..sorted_indices.len() {
             let idx = sorted_indices[k];
             let current_offset = chunks[idx].offset;
@@ -173,6 +187,7 @@ pub fn do_unpack(
             } else {
                 chunks[sorted_indices[k + 1]].offset
             };
+
             if next_offset < current_offset {
                 chunks[idx].real_c_len = chunks[idx]._head_c_len;
             } else {
@@ -181,10 +196,10 @@ pub fn do_unpack(
         }
     }
 
+    // [Optimization] Build Index Map (Chunk ID -> Vector Index) to avoid cloning
     let chunk_indices: HashMap<u16, usize> =
         chunks.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
 
-    // [Fix] Here is where the error was. Now `anyhow!` macro is available.
     let base_name = input_path
         .file_stem()
         .ok_or_else(|| anyhow!("Invalid input file path"))?
@@ -192,6 +207,7 @@ pub fn do_unpack(
     let root_out = out_opt.unwrap_or_else(|| PathBuf::from(&base_name.to_string()));
     fs::create_dir_all(&root_out)?;
 
+    // 8. Start Extraction
     info!(
         "Extracting {} files to {:?}...",
         map_entries.len(),
@@ -213,7 +229,11 @@ pub fn do_unpack(
             format!("{}/{}", raw_dir, fname)
         };
 
+        // 1. Physical extraction path: sanitize_path handles security and basic normalization
         let disk_path = sanitize_path(&root_out, &full_raw_path)?;
+
+        // 2. TOML display path: Replace separators with the OS-specific one.
+        // On Windows, this becomes "path\to\file". On Unix, "path/to/file".
         let rel_path_display = full_raw_path.replace(['/', '\\'], MAIN_SEPARATOR_STR);
         let dir_display = raw_dir.replace(['/', '\\'], MAIN_SEPARATOR_STR);
 
@@ -227,6 +247,7 @@ pub fn do_unpack(
             if let Some(&idx) = chunk_indices.get(cid) {
                 let chunk = &chunks[idx];
 
+                // Prepare source reader (Main file or Split file)
                 let mut source_reader: Box<dyn Read> = if chunk.file_idx == 0 {
                     main_file.seek(SeekFrom::Start(chunk.offset as u64))?;
                     Box::new(main_file.by_ref().take(chunk.real_c_len as u64))
@@ -256,6 +277,7 @@ pub fn do_unpack(
                     }
                 };
 
+                // Decompress
                 if let Err(e) =
                     registry.decompress(&mut source_reader, &mut writer, chunk.flags, chunk.d_len)
                 {
@@ -267,6 +289,7 @@ pub fn do_unpack(
                             "Keeping raw data for chunk {} (DZ_RANGE) in {}",
                             chunk.id, rel_path_display
                         );
+                        // Fallback: Copy raw data
                         let mut raw_reader: Box<dyn Read> = if chunk.file_idx == 0 {
                             main_file.seek(SeekFrom::Start(chunk.offset as u64))?;
                             Box::new(main_file.by_ref().take(chunk.real_c_len as u64))
@@ -288,6 +311,7 @@ pub fn do_unpack(
                             "Failed to decompress {}: {}. Writing raw data.",
                             rel_path_display, e
                         );
+                        // Fallback: Copy raw data on failure
                         let mut raw_reader: Box<dyn Read> = if chunk.file_idx == 0 {
                             main_file.seek(SeekFrom::Start(chunk.offset as u64))?;
                             Box::new(main_file.by_ref().take(chunk.real_c_len as u64))
@@ -303,14 +327,17 @@ pub fn do_unpack(
             }
         }
         writer.flush()?;
+
+        // 9. Save file info for TOML generation
         toml_files.push(FileEntry {
-            path: rel_path_display,
-            directory: dir_display,
+            path: rel_path_display, // Use OS-adaptive separator
+            directory: dir_display, // Use OS-adaptive separator
             filename: fname.clone(),
             chunks: entry.chunk_ids.clone(),
         });
     }
 
+    // 10. Generate TOML Config
     let mut toml_chunks = Vec::new();
     let mut sorted_chunks_for_toml = chunks;
     sorted_chunks_for_toml.sort_by_key(|c| c.id);
