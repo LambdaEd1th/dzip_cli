@@ -44,7 +44,6 @@ enum Commands {
 }
 
 fn main() {
-    // 初始化 Logger
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Cli::parse();
