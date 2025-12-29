@@ -1,18 +1,11 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use log::error;
 use std::path::PathBuf;
 
-use dzip_cli::compression::create_default_registry;
-use dzip_cli::{pack, unpack};
+use dzip_cli::{create_default_registry, do_pack, do_unpack};
 
 #[derive(Parser)]
-#[command(
-    name = "dzip_cli",
-    author = "Ed1th",
-    version,
-    about = "Marmalade SDK .dz Archive Tool",
-    long_about = "A CLI tool to unpack and pack Marmalade SDK .dz archives."
-)]
+#[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,40 +17,41 @@ enum Commands {
     Unpack {
         /// Input .dz file
         input: PathBuf,
-        /// Output directory (optional)
+
+        /// Optional output directory (default: same as input filename)
         #[arg(short, long)]
-        outdir: Option<PathBuf>,
-        /// Keep raw compressed data for unsupported chunks (e.g. CHUNK_DZ)
-        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Keep raw data if decompression fails or for proprietary chunks
+        #[arg(short, long)]
         keep_raw: bool,
     },
-    /// Pack a directory based on a TOML config
+    /// Pack a directory into a .dz archive based on a .toml config
     Pack {
-        /// Input config.toml file
+        /// Input .toml configuration file
         config: PathBuf,
     },
 }
 
-fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let args = Cli::parse();
-
-    // Initialize the codec registry
+fn main() -> Result<()> {
+    // [Fixed]: Removed redundant `use env_logger;`
+    env_logger::init();
+    let cli = Cli::parse();
     let registry = create_default_registry();
 
-    let res = match args.command {
+    match &cli.command {
         Commands::Unpack {
             input,
-            outdir,
+            output,
             keep_raw,
-        } => unpack::do_unpack(&input, outdir, keep_raw, &registry),
-        Commands::Pack { config } => pack::do_pack(&config, &registry),
-    };
-
-    if let Err(e) = res {
-        // Print the full error chain using {:#}
-        error!("{:#}", e);
-        std::process::exit(1);
+        } => {
+            // anyhow handles DzipError automatically here via ?
+            do_unpack(input, output.clone(), *keep_raw, &registry)?;
+        }
+        Commands::Pack { config } => {
+            do_pack(config, &registry)?;
+        }
     }
+
+    Ok(())
 }

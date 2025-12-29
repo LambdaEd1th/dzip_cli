@@ -3,24 +3,39 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DzipError {
-    #[error("I/O Error: {0}")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Format Error: Invalid Magic Header. Expected 'DTRZ' (0x5A525444), found 0x{0:X}")]
+    #[error("IO error at '{0}': {1}")]
+    IoContext(String, #[source] std::io::Error),
+
+    #[error("TOML parsing error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+
+    #[error("TOML serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
+
+    #[error("Invalid magic bytes: expected 0x{0:08x}")]
     InvalidMagic(u32),
 
-    #[error("Security Error: {0}")]
+    #[error("Security error: {0}")]
     Security(String),
 
-    #[error("Configuration Error: {0}")]
+    #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("Missing Resource: Split archive part not found: {0:?}")]
+    #[error("Decompression error: {0}")]
+    Decompression(String),
+
+    #[error("Split archive file missing: {0}")]
     SplitFileMissing(PathBuf),
 
-    #[error("Unsupported Feature: {0}")]
+    #[error("Thread execution failed: {0}")]
+    ThreadPanic(String),
+
+    #[error("Unsupported feature: {0}")]
     Unsupported(String),
 
-    #[error("Decompression Failed: {0}")]
-    Decompression(String),
+    #[error("General error: {0}")]
+    Generic(String),
 }

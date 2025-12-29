@@ -1,4 +1,3 @@
-use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn};
@@ -8,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 
+use crate::Result;
 use crate::compression::CodecRegistry;
 use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, DEFAULT_BUFFER_SIZE, MAGIC};
 use crate::error::DzipError;
@@ -49,29 +49,23 @@ struct RawChunk {
 // --- Main Entry Point ---
 
 pub fn do_unpack(
-    input_path: &Path, // [Fixed]: Changed from &PathBuf to &Path for correct reference type
+    input_path: &Path,
     out_opt: Option<PathBuf>,
     keep_raw: bool,
     registry: &CodecRegistry,
 ) -> Result<()> {
-    // 1. Read archive structure
     let mut ctx = read_archive_structure(input_path)?;
-
-    // 2. Correct Chunk sizes (ZSIZE Correction)
     correct_chunk_sizes(&mut ctx, input_path)?;
 
-    // Prepare output directory
     let base_name = input_path
         .file_stem()
-        .ok_or_else(|| anyhow!("Invalid input file path"))?
+        .ok_or_else(|| DzipError::Generic("Invalid input file path: no stem".to_string()))?
         .to_string_lossy();
     let root_out = out_opt.unwrap_or_else(|| PathBuf::from(base_name.to_string()));
-    fs::create_dir_all(&root_out)?;
+    fs::create_dir_all(&root_out)
+        .map_err(|e| DzipError::IoContext(format!("Creating out dir {:?}", root_out), e))?;
 
-    // 3. Execute unpack (with Progress Bar & DZ support)
     extract_files(&ctx, &root_out, input_path, keep_raw, registry)?;
-
-    // 4. Generate and save configuration
     save_config(&ctx, &base_name, &root_out)?;
 
     Ok(())
@@ -80,15 +74,15 @@ pub fn do_unpack(
 // --- Sub-functions ---
 
 fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
-    let main_file_raw = File::open(input_path)
-        .map_err(DzipError::Io)
-        .context(format!("Failed to open main archive: {:?}", input_path))?;
+    let main_file_raw = File::open(input_path).map_err(|e| {
+        DzipError::IoContext(format!("Failed to open main archive {:?}", input_path), e)
+    })?;
     let main_file_len = main_file_raw.metadata()?.len();
     let mut reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, main_file_raw);
 
     let magic = reader.read_u32::<LittleEndian>()?;
     if magic != MAGIC {
-        return Err(DzipError::InvalidMagic(magic).into());
+        return Err(DzipError::InvalidMagic(magic));
     }
     let num_files = reader.read_u16::<LittleEndian>()?;
     let num_dirs = reader.read_u16::<LittleEndian>()?;
@@ -101,13 +95,14 @@ fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
 
     let mut user_files = Vec::with_capacity(num_files as usize);
     for _ in 0..num_files {
-        user_files.push(read_null_term_string(&mut reader)?);
+        // read_null_term_string now returns io::Result, so mapping to DzipError::Io is correct
+        user_files.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
     }
 
     let mut directories = Vec::with_capacity(num_dirs as usize);
     directories.push(".".to_string());
     for _ in 0..(num_dirs - 1) {
-        directories.push(read_null_term_string(&mut reader)?);
+        directories.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
     }
 
     let mut map_entries = Vec::with_capacity(num_files as usize);
@@ -165,7 +160,7 @@ fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
     if num_arch_files > 1 {
         info!("Reading {} split archive filenames...", num_arch_files - 1);
         for _ in 0..(num_arch_files - 1) {
-            split_file_names.push(read_null_term_string(&mut reader)?);
+            split_file_names.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
         }
     }
 
@@ -216,10 +211,9 @@ fn correct_chunk_sizes(ctx: &mut ArchiveContext, input_path: &Path) -> Result<()
             ctx.main_file_len
         } else {
             let idx = (*f_idx - 1) as usize;
-            let split_name = ctx
-                .split_file_names
-                .get(idx)
-                .ok_or_else(|| anyhow!("Invalid split file index {} in header", f_idx))?;
+            let split_name = ctx.split_file_names.get(idx).ok_or_else(|| {
+                DzipError::Generic(format!("Invalid split file index {} in header", f_idx))
+            })?;
             let split_path = base_dir.join(split_name);
             fs::metadata(&split_path)
                 .map_err(|e| {
@@ -273,7 +267,6 @@ fn extract_files(
         .map(|(i, c)| (c.id, i))
         .collect();
 
-    // Progress Bar Setup
     let pb = ProgressBar::new(ctx.map_entries.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -299,33 +292,33 @@ fn extract_files(
                 format!("{}/{}", raw_dir, fname)
             };
 
+            // [Fixed]: sanitize_path now returns crate::Result, so just ? works
             let disk_path = sanitize_path(root_out, &full_raw_path)?;
 
             if let Some(parent) = disk_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let out_file = File::create(&disk_path)?;
+            let out_file = File::create(&disk_path)
+                .map_err(|e| DzipError::IoContext(format!("Creating file {:?}", disk_path), e))?;
             let mut writer = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, out_file);
 
             for cid in &entry.chunk_ids {
                 if let Some(&idx) = chunk_indices.get(cid) {
                     let chunk = &ctx.chunks[idx];
 
-                    // Thread-Local File Caching (Split archive support)
                     let source_file = match file_cache.entry(chunk.file_idx) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                         std::collections::hash_map::Entry::Vacant(e) => {
                             let f = if chunk.file_idx == 0 {
-                                File::open(input_path).map_err(DzipError::Io)?
+                                File::open(input_path)?
                             } else {
                                 let split_idx = (chunk.file_idx - 1) as usize;
                                 let split_name =
                                     ctx.split_file_names.get(split_idx).ok_or_else(|| {
-                                        anyhow!(
+                                        DzipError::Generic(format!(
                                             "Invalid archive file index {} for chunk {}",
-                                            chunk.file_idx,
-                                            chunk.id
-                                        )
+                                            chunk.file_idx, chunk.id
+                                        ))
                                     })?;
                                 let split_path = base_dir.join(split_name);
                                 File::open(&split_path).map_err(|e| {
@@ -346,27 +339,28 @@ fn extract_files(
                         BufReader::with_capacity(DEFAULT_BUFFER_SIZE, source_file)
                             .take(chunk.real_c_len as u64);
 
-                    // Decompression Logic
                     if let Err(e) = registry.decompress(
                         &mut source_reader,
                         &mut writer,
                         chunk.flags,
                         chunk.d_len,
                     ) {
+                        let err_msg = e.to_string();
+
                         let mut raw_buf_reader = source_reader.into_inner();
                         raw_buf_reader.seek(SeekFrom::Start(chunk.offset as u64))?;
                         let mut raw_take = raw_buf_reader.take(chunk.real_c_len as u64);
 
                         warn!(
                             "Failed to decompress chunk {}: {}. Writing raw data.",
-                            chunk.id, e
+                            chunk.id, err_msg
                         );
                         std::io::copy(&mut raw_take, &mut writer)?;
                     }
                 }
             }
             writer.flush()?;
-            pb.inc(1); // Update progress
+            pb.inc(1);
             Ok(())
         },
     )?;

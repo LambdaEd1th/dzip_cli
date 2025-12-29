@@ -170,7 +170,6 @@ impl Compressor for Bzip2Compressor {
     }
 }
 
-// [New] PassThroughCompressor for raw copying (DZ_RANGE)
 struct PassThroughCompressor;
 impl Compressor for PassThroughCompressor {
     fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {

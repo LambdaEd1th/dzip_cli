@@ -1,4 +1,3 @@
-use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, WriteBytesExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
@@ -10,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use crate::Result;
 use crate::compression::CodecRegistry;
 use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, DEFAULT_BUFFER_SIZE, MAGIC};
 use crate::error::DzipError;
@@ -19,7 +19,6 @@ use crate::utils::{encode_flags, normalize_path};
 // --- Internal Structures ---
 
 struct PackContext {
-    /// 映射: ChunkID -> (绝对路径, 文件内偏移, 读取长度)
     chunk_source_map: HashMap<u16, (Arc<PathBuf>, u64, usize)>,
     sorted_dirs: Vec<String>,
     dir_map: HashMap<String, usize>,
@@ -28,7 +27,6 @@ struct PackContext {
     current_offset_0: u32,
 }
 
-// [Fixed]: New struct to handle type complexity warning
 struct WriterContext {
     main: BufWriter<File>,
     split: HashMap<u16, BufWriter<File>>,
@@ -46,27 +44,26 @@ struct CompressionJob {
 // --- Main Entry Point ---
 
 pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
-    let toml_content = fs::read_to_string(config_path)
-        .context(format!("Failed to read config file: {:?}", config_path))?;
-    let config: Config =
-        toml::from_str(&toml_content).context("Failed to parse TOML configuration")?;
+    let toml_content = fs::read_to_string(config_path).map_err(|e| {
+        DzipError::IoContext(format!("Failed to read config file {:?}", config_path), e)
+    })?;
+    let config: Config = toml::from_str(&toml_content)?;
 
-    let config_parent_dir = config_path
-        .parent()
-        .ok_or_else(|| anyhow!("Cannot determine parent directory of config file"))?;
+    let config_parent_dir = config_path.parent().ok_or_else(|| {
+        DzipError::Config("Cannot determine parent directory of config file".to_string())
+    })?;
 
-    // 1. Index files & prepare metadata
+    // 1. Index files
     let mut ctx = index_source_files(&config, config_path, config_parent_dir)?;
 
     // 2. Prepare output file Writers
-    // [Fixed]: Use struct instead of complex tuple
     let mut writers = prepare_writers(&config, config_parent_dir, &ctx.base_dir_name)?;
 
     // 3. Build and write file header
     let chunk_table_start = build_and_write_header(&config, &ctx, &mut writers.main)?;
     ctx.current_offset_0 = writers.main.stream_position()? as u32;
 
-    // 4. Execute compression pipeline (with Progress Bar)
+    // 4. Execute compression pipeline
     let final_chunks = run_compression_pipeline(
         config.chunks.clone(),
         &ctx,
@@ -96,7 +93,7 @@ fn index_source_files(
 
     let base_dir_name = config_path
         .file_stem()
-        .ok_or_else(|| anyhow!("Invalid config filename"))?
+        .ok_or_else(|| DzipError::Config("Invalid config filename".to_string()))?
         .to_string_lossy()
         .to_string();
 
@@ -120,9 +117,10 @@ fn index_source_files(
         let full_path = resource_root.join(normalized_rel);
 
         if !full_path.exists() {
-            return Err(
-                DzipError::Config(format!("Source file not found: {:?}", full_path)).into(),
-            );
+            return Err(DzipError::Config(format!(
+                "Source file not found: {:?}",
+                full_path
+            )));
         }
 
         let full_path_arc = Arc::new(full_path);
@@ -180,7 +178,6 @@ fn index_source_files(
     })
 }
 
-// [Fixed]: Return WriterContext instead of complex tuple
 fn prepare_writers(
     config: &Config,
     base_path: &Path,
@@ -291,12 +288,8 @@ fn run_compression_pipeline(
     registry: &CodecRegistry,
 ) -> Result<(Vec<ChunkDef>, BufWriter<File>)> {
     sorted_chunks_def.sort_by_key(|c| c.id);
-    info!(
-        "Compressing {} chunks (Pipeline)...",
-        sorted_chunks_def.len()
-    );
+    info!("Compressing {} chunks ...", sorted_chunks_def.len());
 
-    // Progress Bar Setup
     let pb = ProgressBar::new(sorted_chunks_def.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -311,10 +304,10 @@ fn run_compression_pipeline(
         .iter()
         .enumerate()
         .map(|(i, c_def)| {
-            let (source_path, src_offset, read_len) = ctx
-                .chunk_source_map
-                .get(&c_def.id)
-                .ok_or_else(|| anyhow!("Source map missing for chunk ID {}", c_def.id))?;
+            let (source_path, src_offset, read_len) =
+                ctx.chunk_source_map.get(&c_def.id).ok_or_else(|| {
+                    DzipError::Config(format!("Source map missing for chunk ID {}", c_def.id))
+                })?;
             Ok(CompressionJob {
                 chunk_idx: i,
                 source_path: source_path.clone(),
@@ -332,7 +325,6 @@ fn run_compression_pipeline(
     let mut current_offset_0 = ctx.current_offset_0;
     let mut split_offsets_owned = split_offsets.clone();
 
-    // Writer Thread
     let writer_handle = thread::spawn(move || -> Result<(Vec<ChunkDef>, BufWriter<File>)> {
         let total_chunks = sorted_chunks_def.len();
         let mut buffer: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -352,7 +344,11 @@ fn run_compression_pipeline(
                             continue;
                         }
                     }
-                    Err(_) => return Err(anyhow!("Compression threads disconnected")),
+                    Err(_) => {
+                        return Err(DzipError::ThreadPanic(
+                            "Compression threads disconnected".into(),
+                        ));
+                    }
                 }
             };
 
@@ -392,7 +388,7 @@ fn run_compression_pipeline(
             }
             next_idx += 1;
 
-            pb.inc(1); // Update progress
+            pb.inc(1);
         }
 
         pb.finish_with_message("Done");
@@ -413,8 +409,10 @@ fn run_compression_pipeline(
                 BufReader::with_capacity(DEFAULT_BUFFER_SIZE, f_in).take(job.read_len as u64);
             let mut compressed_buffer = Vec::new();
             let flags_int = encode_flags(&job.flags);
-            // Registry now includes PassThroughCompressor for DZ_RANGE, so this just works
-            registry.compress(&mut chunk_reader, &mut compressed_buffer, flags_int)?;
+            // Registry compression errors are now caught and wrapped implicitly (or explicitly mapped)
+            registry
+                .compress(&mut chunk_reader, &mut compressed_buffer, flags_int)
+                .map_err(|e| DzipError::Generic(e.to_string()))?;
             Ok(compressed_buffer)
         })();
         let _ = s.send((job.chunk_idx, res));
@@ -422,7 +420,7 @@ fn run_compression_pipeline(
 
     writer_handle
         .join()
-        .map_err(|e| anyhow!("Writer thread panicked: {:?}", e))?
+        .map_err(|e| DzipError::ThreadPanic(format!("{:?}", e)))?
 }
 
 fn write_final_chunk_table(
