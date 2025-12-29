@@ -118,9 +118,10 @@ fn index_source_files(
         let full_path = resource_root.join(normalized_rel);
 
         if !full_path.exists() {
-            return Err(
-                DzipError::Config(format!("Source file not found: {:?}", full_path)),
-            );
+            return Err(DzipError::Config(format!(
+                "Source file not found: {:?}",
+                full_path
+            )));
         }
 
         let full_path_arc = Arc::new(full_path);
