@@ -127,13 +127,10 @@ fn main() {
                 Ok(entries) => {
                     // Display results in a tabular format
                     println!();
-                    println!("{:<15} | {:<8} | {}", "Size (Bytes)", "Chunks", "Path");
-                    println!(
-                        "{:-<15}-|-{:-<8}-|{}",
-                        "", "", "--------------------------------"
-                    );
+                    // [Fix] Removed arguments for literal strings as per clippy suggestions
+                    println!("{:<15} | {:<8} | Path", "Size (Bytes)", "Chunks");
+                    println!("{:-<15}-|-{:-<8}-|--------------------------------", "", "");
 
-                    // [Fix] Iterate over reference (&entries) to avoid moving ownership
                     for entry in &entries {
                         println!(
                             "{:<15} | {:<8} | {}",
@@ -141,7 +138,6 @@ fn main() {
                         );
                     }
                     println!();
-                    // Now entries is still valid here
                     println!("Total files: {}", entries.len());
                     Ok(())
                 }
