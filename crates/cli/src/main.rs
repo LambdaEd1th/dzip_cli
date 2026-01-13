@@ -4,14 +4,15 @@ use log::{LevelFilter, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-// Import core types and the Observer trait
-use dzip_core::{DzipObserver, create_default_registry, do_pack, do_unpack};
+// Import do_list
+use dzip_core::{
+    DzipObserver, StdFileSystem, create_default_registry, do_list, do_pack, do_unpack,
+};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Enable verbose logging (Debug level) for troubleshooting.
-    /// This is a global argument usable with any subcommand.
     #[arg(short, long, global = true)]
     verbose: bool,
 
@@ -26,11 +27,11 @@ enum Commands {
         /// Input .dz file
         input: PathBuf,
 
-        /// Optional output directory (default: same as input filename)
+        /// Optional output directory
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Keep raw data if decompression fails or for proprietary chunks
+        /// Keep raw data if decompression fails
         #[arg(short, long)]
         keep_raw: bool,
     },
@@ -39,13 +40,14 @@ enum Commands {
         /// Input .toml configuration file
         config: PathBuf,
     },
+    /// List contents of a .dz archive without unpacking
+    List {
+        /// Input .dz file
+        input: PathBuf,
+    },
 }
 
-/// A concrete implementation of DzipObserver for the CLI.
-/// Handles printing logs to stdout/stderr and updating the Indicatif progress bar.
 struct CliProgressObserver {
-    // ProgressBar is wrapped in Mutex because DzipObserver requires Sync.
-    // Option allows us to initialize it only when needed.
     pb: Arc<Mutex<Option<ProgressBar>>>,
 }
 
@@ -96,43 +98,59 @@ impl DzipObserver for CliProgressObserver {
 }
 
 fn main() {
-    // 1. Parse CLI arguments first to check for the --verbose flag
     let cli = Cli::parse();
 
-    // 2. Initialize the logger builder
     let mut builder = env_logger::Builder::from_default_env();
-
-    // Set the default log level to 'Info' if RUST_LOG environment variable is not set.
     if std::env::var("RUST_LOG").is_err() {
         builder.filter(None, LevelFilter::Info);
     }
-
-    // If --verbose is passed, force the log level to 'Debug'.
     if cli.verbose {
         builder.filter(None, LevelFilter::Debug);
     }
-
     builder.init();
 
-    // 3. Create the codec registry
     let registry = create_default_registry();
-
-    // 4. Create the observer for UI feedback
     let observer = CliProgressObserver::new();
+    let fs = StdFileSystem;
 
-    // 5. Execute the command logic
     let result = match &cli.command {
         Commands::Unpack {
             input,
             output,
             keep_raw,
-        } => do_unpack(input, output.clone(), *keep_raw, &registry, &observer),
-        Commands::Pack { config } => do_pack(config, &registry, &observer),
+        } => do_unpack(input, output.clone(), *keep_raw, &registry, &observer, &fs),
+
+        Commands::Pack { config } => do_pack(config, &registry, &observer, &fs),
+
+        Commands::List { input } => {
+            match do_list(input, &observer, &fs) {
+                Ok(entries) => {
+                    // Display results in a tabular format
+                    println!();
+                    println!("{:<15} | {:<8} | {}", "Size (Bytes)", "Chunks", "Path");
+                    println!(
+                        "{:-<15}-|-{:-<8}-|{}",
+                        "", "", "--------------------------------"
+                    );
+
+                    // [Fix] Iterate over reference (&entries) to avoid moving ownership
+                    for entry in &entries {
+                        println!(
+                            "{:<15} | {:<8} | {}",
+                            entry.original_size, entry.chunk_count, entry.path
+                        );
+                    }
+                    println!();
+                    // Now entries is still valid here
+                    println!("Total files: {}", entries.len());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
     };
 
-    // 6. Handle errors gracefully (Optimized Error Reporting)
     if let Err(e) = result {
-        // Print errors in red using ANSI escape codes for better visibility
         eprintln!("\x1b[31mError:\x1b[0m {:#}", e);
         std::process::exit(1);
     }

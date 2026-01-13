@@ -1,39 +1,32 @@
 pub mod compression;
 pub mod constants;
 pub mod error;
+pub mod io;
+pub mod list;
 pub mod pack;
 pub mod types;
 pub mod unpack;
-pub mod utils;
+pub mod utils; // [Added] Register the list module
 
 pub use compression::{CodecRegistry, create_default_registry};
 pub use error::DzipError;
+pub use io::{DzipFileSystem, StdFileSystem};
+pub use list::{ListEntry, do_list}; // [Added] Export list functionality
 pub use pack::do_pack;
 pub use unpack::do_unpack;
 
-/// Library-level Result type alias using DzipError.
+// --- Common Types ---
+
 pub type Result<T> = std::result::Result<T, DzipError>;
 
-/// Observer trait to decouple UI/Logging from core logic.
-/// Implementors must be Thread-Safe (Send + Sync).
 pub trait DzipObserver: Send + Sync {
-    /// Report an informational message.
     fn info(&self, message: &str);
-
-    /// Report a warning message.
     fn warn(&self, message: &str);
-
-    /// Start a progress bar with a total count.
     fn progress_start(&self, total_items: u64);
-
-    /// Increment the progress bar by a specific delta.
     fn progress_inc(&self, delta: u64);
-
-    /// Finish the progress bar with a message.
     fn progress_finish(&self, message: &str);
 }
 
-/// A no-op observer for library users who don't need feedback.
 pub struct NoOpObserver;
 
 impl DzipObserver for NoOpObserver {
