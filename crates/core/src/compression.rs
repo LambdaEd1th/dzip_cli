@@ -1,17 +1,20 @@
 use crate::constants::ChunkFlags;
 use crate::error::DzipError;
-use anyhow::{Context, Result};
+use crate::Result;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
+/// Trait for implementing decompression logic.
 pub trait Decompressor: Send + Sync {
     fn decompress(&self, input: &mut dyn Read, output: &mut dyn Write, len: u32) -> Result<()>;
 }
 
+/// Trait for implementing compression logic.
 pub trait Compressor: Send + Sync {
     fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()>;
 }
 
+/// Registry to hold available compression/decompression algorithms.
 #[derive(Clone)]
 pub struct CodecRegistry {
     decompressors: Vec<(ChunkFlags, Arc<dyn Decompressor>)>,
@@ -48,6 +51,7 @@ impl CodecRegistry {
         self.compressors.push((mask, Arc::new(compressor)));
     }
 
+    /// Decompresses data based on the provided flags.
     pub fn decompress(
         &self,
         input: &mut dyn Read,
@@ -61,11 +65,12 @@ impl CodecRegistry {
                 return decoder.decompress(input, output, len);
             }
         }
-        // Fallback: copy directly (e.g. for COPY or unknown flags processed as raw)
-        io::copy(input, output)?;
+        // Fallback: Copy directly (treat as stored/raw)
+        io::copy(input, output).map_err(DzipError::Io)?;
         Ok(())
     }
 
+    /// Compresses data based on the provided flags.
     pub fn compress(
         &self,
         input: &mut dyn Read,
@@ -78,20 +83,20 @@ impl CodecRegistry {
                 return encoder.compress(input, output);
             }
         }
-        // Fallback: copy directly
-        io::copy(input, output)?;
+        // Fallback: Copy directly
+        io::copy(input, output).map_err(DzipError::Io)?;
         Ok(())
     }
 }
 
-// --- Implementations ---
+// --- Decompressor Implementations ---
 
 struct ZeroDecompressor;
 impl Decompressor for ZeroDecompressor {
     fn decompress(&self, _input: &mut dyn Read, output: &mut dyn Write, len: u32) -> Result<()> {
-        // [Optimization] Use std::io::repeat to avoid allocating a large vector of zeros.
+        // Optimization: Use repeat to generate zeros without large allocations
         let mut zero_reader = std::io::repeat(0).take(len as u64);
-        io::copy(&mut zero_reader, output)?;
+        io::copy(&mut zero_reader, output).map_err(DzipError::Io)?;
         Ok(())
     }
 }
@@ -99,6 +104,7 @@ impl Decompressor for ZeroDecompressor {
 struct LzmaDecompressor;
 impl Decompressor for LzmaDecompressor {
     fn decompress(&self, input: &mut dyn Read, output: &mut dyn Write, _len: u32) -> Result<()> {
+        // Map external LZMA errors to our internal Decompression error type
         let mut lzma_reader = lzma_rust2::LzmaReader::new_mem_limit(input, u32::MAX, None)
             .map_err(|e| DzipError::Decompression(format!("LZMA init: {}", e)))?;
         io::copy(&mut lzma_reader, output)
@@ -130,22 +136,22 @@ impl Decompressor for Bzip2Decompressor {
 struct PassThroughDecompressor;
 impl Decompressor for PassThroughDecompressor {
     fn decompress(&self, input: &mut dyn Read, output: &mut dyn Write, _len: u32) -> Result<()> {
-        // Direct copy for DZ_RANGE or COPY
-        io::copy(input, output)?;
+        io::copy(input, output).map_err(DzipError::Io)?;
         Ok(())
     }
 }
 
-// --- Compressors ---
+// --- Compressor Implementations ---
 
 struct LzmaCompressor;
 impl Compressor for LzmaCompressor {
     fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
         let options = lzma_rust2::LzmaOptions::default();
+        // Replace 'anyhow::Context' with explicit error mapping
         let mut w = lzma_rust2::LzmaWriter::new_use_header(output, &options, None)
-            .context("Failed to initialize LZMA writer")?;
-        io::copy(input, &mut w)?;
-        w.finish()?;
+            .map_err(|e| DzipError::Decompression(format!("LZMA writer init: {}", e)))?;
+        io::copy(input, &mut w).map_err(DzipError::Io)?;
+        w.finish().map_err(DzipError::Io)?;
         Ok(())
     }
 }
@@ -154,8 +160,8 @@ struct ZlibCompressor;
 impl Compressor for ZlibCompressor {
     fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
         let mut e = flate2::write::ZlibEncoder::new(output, flate2::Compression::default());
-        io::copy(input, &mut e)?;
-        e.finish()?;
+        io::copy(input, &mut e).map_err(DzipError::Io)?;
+        e.finish().map_err(DzipError::Io)?;
         Ok(())
     }
 }
@@ -164,8 +170,8 @@ struct Bzip2Compressor;
 impl Compressor for Bzip2Compressor {
     fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
         let mut e = bzip2::write::BzEncoder::new(output, bzip2::Compression::default());
-        io::copy(input, &mut e)?;
-        e.finish()?;
+        io::copy(input, &mut e).map_err(DzipError::Io)?;
+        e.finish().map_err(DzipError::Io)?;
         Ok(())
     }
 }
@@ -173,7 +179,7 @@ impl Compressor for Bzip2Compressor {
 struct PassThroughCompressor;
 impl Compressor for PassThroughCompressor {
     fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
-        io::copy(input, output)?;
+        io::copy(input, output).map_err(DzipError::Io)?;
         Ok(())
     }
 }
@@ -189,7 +195,6 @@ pub fn create_default_registry() -> CodecRegistry {
     reg.register_compressor(ChunkFlags::LZMA, LzmaCompressor);
     reg.register_compressor(ChunkFlags::ZLIB, ZlibCompressor);
     reg.register_compressor(ChunkFlags::BZIP, Bzip2Compressor);
-    // Register PassThroughCompressor for DZ_RANGE (Proprietary format)
     reg.register_compressor(ChunkFlags::DZ_RANGE, PassThroughCompressor);
     reg
 }

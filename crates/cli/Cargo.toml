@@ -1,0 +1,16 @@
+[package]
+name = "dzip-cli"
+version = "0.2.0"
+authors = ["Ed1th"]
+description = "A CLI tool to unpack and pack Marmalade SDK .dz archives."
+edition = "2024"
+
+[dependencies]
+# Import the core library locally
+dzip-core = { path = "../core" }
+
+# CLI specific dependencies (UI/Args/Logs)
+clap = { version = "4.5.53", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+indicatif = "0.18.3"

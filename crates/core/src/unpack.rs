@@ -1,20 +1,18 @@
 use byteorder::{LittleEndian, ReadBytesExt};
-use indicatif::{ProgressBar, ProgressStyle};
-use log::{info, warn};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 
-use crate::Result;
 use crate::compression::CodecRegistry;
 use crate::constants::{
-    CHUNK_LIST_TERMINATOR, CURRENT_DIR_STR, ChunkFlags, DEFAULT_BUFFER_SIZE, MAGIC,
+    ChunkFlags, CHUNK_LIST_TERMINATOR, CURRENT_DIR_STR, DEFAULT_BUFFER_SIZE, MAGIC,
 };
 use crate::error::DzipError;
 use crate::types::{ArchiveMeta, ChunkDef, Config, FileEntry, RangeSettings};
 use crate::utils::{decode_flags, read_null_term_string, sanitize_path};
+use crate::{DzipObserver, Result};
 
 // --- Internal Structures ---
 
@@ -55,10 +53,15 @@ pub fn do_unpack(
     out_opt: Option<PathBuf>,
     keep_raw: bool,
     registry: &CodecRegistry,
+    observer: &dyn DzipObserver,
 ) -> Result<()> {
-    let mut ctx = read_archive_structure(input_path)?;
+    // Phase 1: Read archive structure
+    let mut ctx = read_archive_structure(input_path, observer)?;
+
+    // Phase 2: Fix legacy chunk sizes
     correct_chunk_sizes(&mut ctx, input_path)?;
 
+    // Determine output directory
     let base_name = input_path
         .file_stem()
         .ok_or_else(|| DzipError::Generic("Invalid input file path: no stem".to_string()))?
@@ -67,33 +70,39 @@ pub fn do_unpack(
     fs::create_dir_all(&root_out)
         .map_err(|e| DzipError::IoContext(format!("Creating out dir {:?}", root_out), e))?;
 
-    extract_files(&ctx, &root_out, input_path, keep_raw, registry)?;
-    save_config(&ctx, &base_name)?;
+    // Phase 3: Extract files
+    extract_files(&ctx, &root_out, input_path, keep_raw, registry, observer)?;
+
+    // Phase 4: Generate config for repacking
+    save_config(&ctx, &base_name, observer)?;
 
     Ok(())
 }
 
 // --- Sub-functions ---
 
-fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
+fn read_archive_structure(
+    input_path: &Path,
+    observer: &dyn DzipObserver,
+) -> Result<ArchiveContext> {
     let main_file_raw = File::open(input_path).map_err(|e| {
         DzipError::IoContext(format!("Failed to open main archive {:?}", input_path), e)
     })?;
-    let main_file_len = main_file_raw.metadata()?.len();
+    let main_file_len = main_file_raw.metadata().map_err(DzipError::Io)?.len();
     let mut reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, main_file_raw);
 
-    let magic = reader.read_u32::<LittleEndian>()?;
+    let magic = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
     if magic != MAGIC {
         return Err(DzipError::InvalidMagic(magic));
     }
-    let num_files = reader.read_u16::<LittleEndian>()?;
-    let num_dirs = reader.read_u16::<LittleEndian>()?;
-    let version = reader.read_u8()?;
+    let num_files = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
+    let num_dirs = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
+    let version = reader.read_u8().map_err(DzipError::Io)?;
 
-    info!(
+    observer.info(&format!(
         "Header: Ver {}, Files {}, Dirs {}",
         version, num_files, num_dirs
-    );
+    ));
 
     let mut user_files = Vec::with_capacity(num_files as usize);
     for _ in 0..num_files {
@@ -108,10 +117,10 @@ fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
 
     let mut map_entries = Vec::with_capacity(num_files as usize);
     for i in 0..num_files {
-        let dir_id = reader.read_u16::<LittleEndian>()? as usize;
+        let dir_id = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)? as usize;
         let mut chunk_ids = Vec::new();
         loop {
-            let cid = reader.read_u16::<LittleEndian>()?;
+            let cid = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
             if cid == CHUNK_LIST_TERMINATOR {
                 break;
             }
@@ -124,22 +133,22 @@ fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
         });
     }
 
-    let num_arch_files = reader.read_u16::<LittleEndian>()?;
-    let num_chunks = reader.read_u16::<LittleEndian>()?;
-    info!(
+    let num_arch_files = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
+    let num_chunks = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
+    observer.info(&format!(
         "Chunk Settings: {} chunks in {} archive files",
         num_chunks, num_arch_files
-    );
+    ));
 
     let mut chunks = Vec::with_capacity(num_chunks as usize);
     let mut has_dz_chunk = false;
 
     for i in 0..num_chunks {
-        let offset = reader.read_u32::<LittleEndian>()?;
-        let c_len = reader.read_u32::<LittleEndian>()?;
-        let d_len = reader.read_u32::<LittleEndian>()?;
-        let flags_raw = reader.read_u16::<LittleEndian>()?;
-        let file_idx = reader.read_u16::<LittleEndian>()?;
+        let offset = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
+        let c_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
+        let d_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
+        let flags_raw = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
+        let file_idx = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
 
         let flags = ChunkFlags::from_bits_truncate(flags_raw);
         if flags.contains(ChunkFlags::DZ_RANGE) {
@@ -159,7 +168,10 @@ fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
 
     let mut split_file_names = Vec::new();
     if num_arch_files > 1 {
-        info!("Reading {} split archive filenames...", num_arch_files - 1);
+        observer.info(&format!(
+            "Reading {} split archive filenames...",
+            num_arch_files - 1
+        ));
         for _ in 0..(num_arch_files - 1) {
             split_file_names.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
         }
@@ -167,18 +179,19 @@ fn read_archive_structure(input_path: &Path) -> Result<ArchiveContext> {
 
     let mut range_settings = None;
     if has_dz_chunk {
-        info!("Detected CHUNK_DZ, reading RangeSettings...");
+        observer.info("Detected CHUNK_DZ, reading RangeSettings...");
+        // Using map_err for basic IO errors during read
         range_settings = Some(RangeSettings {
-            win_size: reader.read_u8()?,
-            flags: reader.read_u8()?,
-            offset_table_size: reader.read_u8()?,
-            offset_tables: reader.read_u8()?,
-            offset_contexts: reader.read_u8()?,
-            ref_length_table_size: reader.read_u8()?,
-            ref_length_tables: reader.read_u8()?,
-            ref_offset_table_size: reader.read_u8()?,
-            ref_offset_tables: reader.read_u8()?,
-            big_min_match: reader.read_u8()?,
+            win_size: reader.read_u8().map_err(DzipError::Io)?,
+            flags: reader.read_u8().map_err(DzipError::Io)?,
+            offset_table_size: reader.read_u8().map_err(DzipError::Io)?,
+            offset_tables: reader.read_u8().map_err(DzipError::Io)?,
+            offset_contexts: reader.read_u8().map_err(DzipError::Io)?,
+            ref_length_table_size: reader.read_u8().map_err(DzipError::Io)?,
+            ref_length_tables: reader.read_u8().map_err(DzipError::Io)?,
+            ref_offset_table_size: reader.read_u8().map_err(DzipError::Io)?,
+            ref_offset_tables: reader.read_u8().map_err(DzipError::Io)?,
+            big_min_match: reader.read_u8().map_err(DzipError::Io)?,
         });
     }
 
@@ -252,12 +265,13 @@ fn extract_files(
     input_path: &Path,
     keep_raw: bool,
     registry: &CodecRegistry,
+    observer: &dyn DzipObserver,
 ) -> Result<()> {
-    info!(
+    observer.info(&format!(
         "Extracting {} files to {:?}...",
         ctx.map_entries.len(),
         root_out
-    );
+    ));
 
     let base_dir = input_path.parent().unwrap_or(Path::new(CURRENT_DIR_STR));
 
@@ -268,18 +282,9 @@ fn extract_files(
         .map(|(i, c)| (c.id, i))
         .collect();
 
-    let pb = ProgressBar::new(ctx.map_entries.len() as u64);
+    observer.progress_start(ctx.map_entries.len() as u64);
 
-    let style = ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .unwrap_or_else(|e| {
-            log::warn!("Failed to set progress bar template: {}", e);
-            ProgressStyle::default_bar()
-        })
-        .progress_chars("#>-");
-
-    pb.set_style(style);
-
+    // Use Rayon for parallel extraction
     ctx.map_entries.par_iter().try_for_each_init(
         HashMap::new,
         |file_cache: &mut HashMap<u16, File>, entry| -> Result<()> {
@@ -298,7 +303,7 @@ fn extract_files(
             let disk_path = sanitize_path(root_out, &full_raw_path)?;
 
             if let Some(parent) = disk_path.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(DzipError::Io)?;
             }
             let out_file = File::create(&disk_path)
                 .map_err(|e| DzipError::IoContext(format!("Creating file {:?}", disk_path), e))?;
@@ -341,7 +346,7 @@ fn extract_files(
                         }
                     };
 
-                    source_file.seek(SeekFrom::Start(chunk.offset as u64))?;
+                    source_file.seek(SeekFrom::Start(chunk.offset as u64)).map_err(DzipError::Io)?;
 
                     let mut source_reader =
                         BufReader::with_capacity(DEFAULT_BUFFER_SIZE, source_file)
@@ -357,31 +362,31 @@ fn extract_files(
                             let err_msg = e.to_string();
 
                             let mut raw_buf_reader = source_reader.into_inner();
-                            raw_buf_reader.seek(SeekFrom::Start(chunk.offset as u64))?;
+                            raw_buf_reader.seek(SeekFrom::Start(chunk.offset as u64)).map_err(DzipError::Io)?;
                             let mut raw_take = raw_buf_reader.take(chunk.real_c_len as u64);
 
-                            warn!(
+                            observer.warn(&format!(
                                 "Failed to decompress chunk {}: {}. Writing raw data (keep-raw enabled).",
                                 chunk.id, err_msg
-                            );
-                            std::io::copy(&mut raw_take, &mut writer)?;
+                            ));
+                            std::io::copy(&mut raw_take, &mut writer).map_err(DzipError::Io)?;
                         } else {
-                             return Err(DzipError::Decompression(e.to_string()));
+                             return Err(e); // DzipError propagates directly
                         }
                     }
                 }
             }
-            writer.flush()?;
-            pb.inc(1);
+            writer.flush().map_err(DzipError::Io)?;
+            observer.progress_inc(1);
             Ok(())
         },
     )?;
 
-    pb.finish_with_message("Done");
+    observer.progress_finish("Done");
     Ok(())
 }
 
-fn save_config(ctx: &ArchiveContext, base_name: &str) -> Result<()> {
+fn save_config(ctx: &ArchiveContext, base_name: &str, observer: &dyn DzipObserver) -> Result<()> {
     let mut toml_files = Vec::new();
     for entry in &ctx.map_entries {
         let fname = &ctx.user_files[entry.id];
@@ -435,7 +440,10 @@ fn save_config(ctx: &ArchiveContext, base_name: &str) -> Result<()> {
     };
 
     let config_path = format!("{}.toml", base_name);
-    fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-    info!("Unpack complete. Config saved to {}", config_path);
+    // Convert toml serialization errors
+    let toml_str = toml::to_string_pretty(&config).map_err(DzipError::TomlSer)?;
+    fs::write(&config_path, toml_str).map_err(DzipError::Io)?;
+
+    observer.info(&format!("Unpack complete. Config saved to {}", config_path));
     Ok(())
 }

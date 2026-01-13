@@ -9,7 +9,8 @@ on:
       - "v*"
 
 env:
-  # TODO: Replace with your actual binary name as defined in Cargo.toml
+  # The name of the binary to release.
+  # This matches the package name in crates/cli/Cargo.toml
   BIN_NAME: dzip-cli
 
 jobs:
@@ -25,33 +26,26 @@ jobs:
             target: x86_64-unknown-linux-gnu
             use_cross: false
             suffix: ""
-
           # --- Linux AArch64 (ARM64) ---
-          # Uses 'cross' because standard GitHub runners are x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use_cross: true
             suffix: ""
-
           # --- Windows x86_64 ---
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             use_cross: false
             suffix: ".exe"
-
           # --- Windows AArch64 (ARM64) ---
-          # Windows ARM64 can be compiled natively on x64 runners via MSVC
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             use_cross: false
             suffix: ".exe"
-
           # --- macOS x86_64 (Intel) ---
           - os: macos-latest
             target: x86_64-apple-darwin
             use_cross: false
             suffix: ""
-
           # --- macOS AArch64 (Apple Silicon) ---
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -71,47 +65,52 @@ jobs:
         uses: taiki-e/install-action@cross
 
       - name: Build Release Binary
-        # Use bash on all platforms to ensure consistent script syntax
         shell: bash
         run: |
+          # Determine the build command (cargo or cross)
           CMD=cargo
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
             CMD=cross
           fi
-          $CMD build --release --target ${{ matrix.target }}
+
+          # Build the specific CLI package using '-p dzip-cli'.
+          # This ensures we only compile the binary we intend to release,
+          # avoiding issues if other binaries are added to the workspace later.
+          $CMD build --release --target ${{ matrix.target }} -p dzip-cli
 
       - name: Package Release Asset
         id: package
         shell: bash
         run: |
-          # 1. Setup variables
-          # The folder name inside the archive: project-version-platform
+          # 1. Define release names
           RELEASE_NAME="${{ env.BIN_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
           ARCHIVE_NAME="${RELEASE_NAME}.tar.gz"
 
-          # Path to the compiled binary
+          # 2. Locate the compiled binary
+          # Note: Even in a workspace, artifacts are stored in the root 'target/' directory.
           BIN_PATH="target/${{ matrix.target }}/release/${{ env.BIN_NAME }}${{ matrix.suffix }}"
 
-          # 2. Verify existence of the binary
+          # 3. Verify existence of the binary
           if [ ! -f "$BIN_PATH" ]; then
               echo "Error: Binary not found at $BIN_PATH"
+              # List target directory for debugging if build failed silently
+              ls -R target/
               exit 1
           fi
 
-          # 3. Create a temporary directory for packaging
-          # This ensures the user extracts a directory rather than loose files
+          # 4. Create a temporary directory for staging
           mkdir "$RELEASE_NAME"
 
-          # 4. Copy the binary and documentation files
+          # 5. Copy binary and metadata files
           cp "$BIN_PATH" "$RELEASE_NAME/"
+          # README and LICENSE are located in the workspace root
           if [ -f "README.md" ]; then cp "README.md" "$RELEASE_NAME/"; fi
           if [ -f "LICENSE" ]; then cp "LICENSE" "$RELEASE_NAME/"; fi
 
-          # 5. Create the .tar.gz archive
-          # -c: create, -z: gzip, -v: verbose, -f: file
+          # 6. Compress the directory into a tarball
           tar -czvf "$ARCHIVE_NAME" "$RELEASE_NAME"
 
-          # 6. Set the output for the next step
+          # 7. Output the path for the upload step
           echo "asset_path=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload Release Asset

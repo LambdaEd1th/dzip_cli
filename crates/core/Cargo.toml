@@ -1,0 +1,17 @@
+[package]
+name = "dzip-core"
+version = "0.2.0"
+authors = ["Ed1th"]
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.17"
+byteorder = "1.5.0"
+flate2 = "1.1.5"
+lzma-rust2 = "0.15.4"
+bzip2 = "0.6.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.148"
+toml = "0.9.8"
+bitflags = "2.10.0"
+rayon = "1.11.0"
