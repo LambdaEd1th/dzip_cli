@@ -16,7 +16,6 @@ use crate::model::{ArchiveMeta, ChunkDef, Config, FileEntry, RangeSettings};
 use crate::utils::{decode_flags, read_null_term_string, to_native_path}; // Changed import
 
 // --- Structures ---
-// (Keep ArchiveMetadata, UnpackPlan, FileMapEntry, RawChunk definitions as is)
 #[derive(Debug)]
 pub struct ArchiveMetadata {
     pub version: u8,
@@ -70,7 +69,6 @@ pub fn do_unpack(
 // --- Implementations ---
 
 impl ArchiveMetadata {
-    // (Keep load, read_header_basic, read_file_names, etc. as is)
     pub fn load(source: &dyn UnpackSource) -> Result<Self> {
         let mut main_file_raw = source.open_main()?;
         let main_file_len = main_file_raw
@@ -305,14 +303,12 @@ impl UnpackPlan {
                     path_buf = PathBuf::from(fname);
                 }
 
-                // [Changed] Use to_native_path so Sink receives OS-specific paths.
                 let rel_path = to_native_path(&path_buf);
 
                 if let Some(parent) = path_buf
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty() && p.as_os_str() != ".")
                 {
-                    // [Changed] Create directories using native paths
                     sink.create_dir_all(&to_native_path(parent))?;
                 }
 
@@ -394,7 +390,6 @@ impl UnpackPlan {
                 path_buf = PathBuf::from(fname);
             }
 
-            // [Changed] Use to_native_path so the TOML file contains OS-specific paths.
             // On Windows this will contain backslashes, on macOS forward slashes.
             let full_raw_path = to_native_path(&path_buf);
             let normalized_dir = to_native_path(Path::new(raw_dir));
@@ -406,7 +401,6 @@ impl UnpackPlan {
                 chunks: entry.chunk_ids.clone(),
             });
         }
-        // (Chunk generation code unchanged)
         let mut toml_chunks = Vec::new();
         let mut sorted_chunks = self.processed_chunks.clone();
         sorted_chunks.sort_by_key(|c| c.id);

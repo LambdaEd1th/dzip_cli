@@ -57,7 +57,6 @@ pub fn do_pack(
 impl PackPlan {
     pub fn build(config: Config, base_dir_name: String, source: &dyn PackSource) -> Result<Self> {
         info!("Indexing source files...");
-        // (Chunk definition loading map code unchanged)
         let mut chunk_map_def = HashMap::new();
         let mut has_dz_chunk = false;
         for c in &config.chunks {
@@ -109,7 +108,6 @@ impl PackPlan {
             if d.is_empty() || d == CURRENT_DIR_STR {
                 unique_dirs.insert(CURRENT_DIR_STR.to_string());
             } else {
-                // [Changed] Use to_archive_path!
                 // Even if the input 'd' comes from a Windows TOML (with backslashes),
                 // to_archive_path will convert it to "a/b/c" so the header is correct.
                 unique_dirs.insert(to_archive_path(Path::new(d)));
@@ -153,7 +151,6 @@ impl PackPlan {
         Ok(())
     }
 
-    // (prepare_writers unchanged)
     fn prepare_writers(&self, sink: &mut dyn PackSink) -> Result<WriterContext> {
         let f0 = sink.create_main()?;
         let writer0 = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, f0);
@@ -195,7 +192,6 @@ impl PackPlan {
             header_buffer.write_u8(0).map_err(DzipError::Io)?;
         }
         for f in &self.config.files {
-            // [Changed] Convert file directory to archive format to look up the ID
             let raw_d = to_archive_path(Path::new(&f.directory));
             let d_key = if raw_d.is_empty() || raw_d == CURRENT_DIR_STR {
                 CURRENT_DIR_STR
@@ -277,7 +273,6 @@ impl PackPlan {
         Ok(chunk_table_start)
     }
 
-    // (run_compression_pipeline and write_final_chunk_table unchanged, they just copy data)
     fn run_compression_pipeline(
         &self,
         start_offset_0: u32,
@@ -285,7 +280,6 @@ impl PackPlan {
         mut split_writers: HashMap<u16, BufWriter<BoxedWriter>>,
         source: &dyn PackSource,
     ) -> Result<PipelineOutput> {
-        // (Keep existing implementation...)
         // Note: Since run_compression_pipeline is long and logic unchanged, I will omit full repetition here for brevity unless requested.
         // Just ensure it uses the struct fields which are already processed correctly.
         // ... (Logic same as previous version)
@@ -429,7 +423,6 @@ impl PackPlan {
         table_start_pos: u64,
         chunks: &[ChunkDef],
     ) -> Result<()> {
-        // (Keep existing implementation...)
         let mut table_buffer = Cursor::new(Vec::new());
         for c in chunks {
             table_buffer
@@ -464,7 +457,6 @@ impl PackPlan {
     }
 }
 
-// (Helper Structs CountingReader unchanged)
 struct CountingReader<R> {
     inner: R,
     count: u64,
