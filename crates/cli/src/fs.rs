@@ -2,20 +2,7 @@ use dzip_core::{
     PackSink, PackSource, ReadSeekSend, Result, UnpackSink, UnpackSource, WriteSeekSend, WriteSend,
 };
 use std::fs::{self, File};
-use std::path::{Component, MAIN_SEPARATOR_STR, Path, PathBuf};
-
-/// Normalizes a path to prevent directory traversal attacks (..).
-/// This sanitizes paths from the config/archive before they are used for FS operations.
-pub fn normalize_path(path: &Path) -> PathBuf {
-    let components = path.components();
-    let mut normalized = PathBuf::new();
-    for c in components {
-        if let Component::Normal(os_str) = c {
-            normalized.push(os_str);
-        }
-    }
-    normalized
-}
+use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 
 // --- Unpack Implementations ---
 
@@ -63,7 +50,6 @@ impl UnpackSink for FsUnpackSink {
     }
 
     fn create_file(&self, rel_path: &str) -> Result<Box<dyn WriteSend>> {
-        // [Optimization] Collapsed consecutive replace calls.
         let os_rel_path = rel_path.replace(['/', '\\'], MAIN_SEPARATOR_STR);
 
         let p = self.output_dir.join(&os_rel_path);

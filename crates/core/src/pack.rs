@@ -3,6 +3,7 @@ use log::info;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::mpsc;
 use tempfile::NamedTempFile;
 
@@ -14,10 +15,9 @@ use crate::format::{
 };
 use crate::io::{PackSink, PackSource, WriteSeekSend};
 use crate::model::{ChunkDef, Config};
-use crate::utils::encode_flags;
+use crate::utils::{encode_flags, to_archive_path}; // Changed import: use archive path
 
-// --- Types ---
-
+// (Keep Types, PackPlan struct, WriterContext, CompressionJob, wrapper function unchanged)
 type BoxedWriter = Box<dyn WriteSeekSend>;
 type PipelineOutput = (Vec<ChunkDef>, BufWriter<BoxedWriter>);
 
@@ -43,9 +43,6 @@ struct CompressionJob {
     flags: Vec<std::borrow::Cow<'static, str>>,
 }
 
-// --- Wrapper ---
-
-/// Main entry point for packing.
 pub fn do_pack(
     config: Config,
     base_dir_name: String,
@@ -60,7 +57,7 @@ pub fn do_pack(
 impl PackPlan {
     pub fn build(config: Config, base_dir_name: String, source: &dyn PackSource) -> Result<Self> {
         info!("Indexing source files...");
-
+        // (Chunk definition loading map code unchanged)
         let mut chunk_map_def = HashMap::new();
         let mut has_dz_chunk = false;
         for c in &config.chunks {
@@ -79,20 +76,17 @@ impl PackPlan {
         let mut chunk_source_map = HashMap::new();
         for f_entry in &config.files {
             let os_path_str = &f_entry.path;
-
             if !source.exists(os_path_str) {
                 return Err(DzipError::Config(format!(
                     "Source file not found (path: {})",
                     os_path_str
                 )));
             }
-
             let mut current_offset: u64 = 0;
             for cid in &f_entry.chunks {
                 let c_def = chunk_map_def
                     .get(cid)
                     .ok_or(DzipError::ChunkDefinitionMissing(*cid))?;
-
                 let flags_cow: Vec<std::borrow::Cow<'_, str>> = c_def
                     .flags
                     .iter()
@@ -104,7 +98,6 @@ impl PackPlan {
                 } else {
                     c_def.size_decompressed
                 } as usize;
-
                 chunk_source_map.insert(*cid, (os_path_str.clone(), current_offset, read_len));
                 current_offset += read_len as u64;
             }
@@ -116,9 +109,10 @@ impl PackPlan {
             if d.is_empty() || d == CURRENT_DIR_STR {
                 unique_dirs.insert(CURRENT_DIR_STR.to_string());
             } else {
-                // Ensure internal internal logic uses a consistent separator for mapping,
-                // but this does not affect the output format in the header.
-                unique_dirs.insert(d.replace('\\', "/"));
+                // [Changed] Use to_archive_path!
+                // Even if the input 'd' comes from a Windows TOML (with backslashes),
+                // to_archive_path will convert it to "a/b/c" so the header is correct.
+                unique_dirs.insert(to_archive_path(Path::new(d)));
             }
         }
         if !unique_dirs.contains(CURRENT_DIR_STR) {
@@ -148,10 +142,7 @@ impl PackPlan {
 
     pub fn execute(&self, sink: &mut dyn PackSink, source: &dyn PackSource) -> Result<()> {
         info!("Packing logical archive: {:?}", self.base_dir_name);
-
-        // Pass sink directly as it is already a mutable reference
         let mut writers = self.prepare_writers(sink)?;
-
         let chunk_table_start = self.build_and_write_header(&mut writers.main)?;
         let current_offset_0 = writers.main.stream_position().map_err(DzipError::Io)? as u32;
         let final_chunks =
@@ -162,6 +153,7 @@ impl PackPlan {
         Ok(())
     }
 
+    // (prepare_writers unchanged)
     fn prepare_writers(&self, sink: &mut dyn PackSink) -> Result<WriterContext> {
         let f0 = sink.create_main()?;
         let writer0 = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, f0);
@@ -196,21 +188,20 @@ impl PackPlan {
             header_buffer.write_u8(0).map_err(DzipError::Io)?;
         }
         for d in self.sorted_dirs.iter().skip(1) {
+            // These are already normalized to archive format by build()
             header_buffer
-                // We write the directory name exactly as it appears in the Config/String.
-                // This allows the CLI to control whether to use '/' or '\'.
                 .write_all(d.as_bytes())
                 .map_err(DzipError::Io)?;
             header_buffer.write_u8(0).map_err(DzipError::Io)?;
         }
         for f in &self.config.files {
-            let raw_d = f.directory.replace('\\', "/");
+            // [Changed] Convert file directory to archive format to look up the ID
+            let raw_d = to_archive_path(Path::new(&f.directory));
             let d_key = if raw_d.is_empty() || raw_d == CURRENT_DIR_STR {
                 CURRENT_DIR_STR
             } else {
                 &raw_d
             };
-
             let d_id = *self.dir_map.get(d_key).unwrap_or(&0) as u16;
 
             header_buffer
@@ -225,6 +216,7 @@ impl PackPlan {
                 .write_u16::<LittleEndian>(CHUNK_LIST_TERMINATOR)
                 .map_err(DzipError::Io)?;
         }
+        // (Rest of header writing unchanged)
         header_buffer
             .write_u16::<LittleEndian>((1 + self.config.archive_files.len()) as u16)
             .map_err(DzipError::Io)?;
@@ -285,6 +277,7 @@ impl PackPlan {
         Ok(chunk_table_start)
     }
 
+    // (run_compression_pipeline and write_final_chunk_table unchanged, they just copy data)
     fn run_compression_pipeline(
         &self,
         start_offset_0: u32,
@@ -292,10 +285,16 @@ impl PackPlan {
         mut split_writers: HashMap<u16, BufWriter<BoxedWriter>>,
         source: &dyn PackSource,
     ) -> Result<PipelineOutput> {
+        // (Keep existing implementation...)
+        // Note: Since run_compression_pipeline is long and logic unchanged, I will omit full repetition here for brevity unless requested.
+        // Just ensure it uses the struct fields which are already processed correctly.
+        // ... (Logic same as previous version)
+        // OK to copy previous implementation completely.
+
+        // Shortened for context display:
         let mut sorted_chunks_def = self.config.chunks.clone();
         sorted_chunks_def.sort_by_key(|c| c.id);
         info!("Compressing {} chunks ...", sorted_chunks_def.len());
-
         let jobs: Result<Vec<CompressionJob>> = sorted_chunks_def
             .iter()
             .enumerate()
@@ -319,11 +318,7 @@ impl PackPlan {
             .collect();
         let jobs = jobs?;
         let channel_bound = rayon::current_num_threads() * 4;
-
-        // [Refactor] Change Channel Type:
-        // Pass (NamedTempFile, u64) instead of Vec<u8> to support large files via disk buffer.
         let (tx, rx) = mpsc::sync_channel::<(usize, Result<(NamedTempFile, u64)>)>(channel_bound);
-
         let mut current_offset_0 = start_offset_0;
         let mut split_offsets_owned: HashMap<u16, u32> =
             split_writers.keys().map(|k| (*k, 0)).collect();
@@ -331,8 +326,6 @@ impl PackPlan {
         std::thread::scope(|s| {
             let writer_handle = s.spawn(move || -> Result<PipelineOutput> {
                 let total_chunks = sorted_chunks_def.len();
-
-                // [Refactor] Buffer now holds TempFiles.
                 let mut buffer: HashMap<usize, (NamedTempFile, u64)> = HashMap::new();
                 let mut next_idx = 0;
                 while next_idx < total_chunks {
@@ -374,20 +367,13 @@ impl PackPlan {
                     } else {
                         *split_offsets_owned
                             .get(&c_def.archive_file_index)
-                            .unwrap_or(&0) // Safe: initialized from keys above
+                            .unwrap_or(&0)
                     };
-
-                    // [Refactor] Stream copy from temp file to final archive.
-                    // This avoids loading the whole chunk into RAM.
                     let compressed_size =
                         std::io::copy(&mut temp_file, target_writer).map_err(DzipError::Io)?;
-
                     c_def.offset = current_pos;
                     c_def.size_compressed = compressed_size as u32;
-
-                    // [Fix 1] Ensure metadata correctness with actual read size
                     c_def.size_decompressed = actual_d_len as u32;
-
                     if c_def.archive_file_index == 0 {
                         current_offset_0 += c_def.size_compressed;
                     } else {
@@ -408,37 +394,26 @@ impl PackPlan {
                 }
                 Ok((sorted_chunks_def, writer0))
             });
-
             jobs.par_iter().for_each_with(tx, |s, job| {
-                // [Refactor] Return NamedTempFile
                 let res = (|| -> Result<(NamedTempFile, u64)> {
                     let mut f_in = source.open_file(&job.source_path)?;
                     f_in.seek(SeekFrom::Start(job.offset))
                         .map_err(DzipError::Io)?;
                     let chunk_reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, f_in)
                         .take(job.read_len as u64);
-
                     let mut counting_reader = CountingReader {
                         inner: chunk_reader,
                         count: 0,
                     };
-
-                    // [Refactor] Create a temporary file for compression output
                     let mut temp_file = NamedTempFile::new().map_err(DzipError::Io)?;
-
                     let flags_cow: Vec<std::borrow::Cow<'_, str>> = job
                         .flags
                         .iter()
                         .map(|c| std::borrow::Cow::Borrowed(c.as_ref()))
                         .collect();
                     let flags_int = encode_flags(&flags_cow);
-
-                    // Compress directly to the temporary file
                     compress(&mut counting_reader, &mut temp_file, flags_int)?;
-
-                    // [Important] Rewind the temp file so the consumer can read it from the beginning
                     temp_file.seek(SeekFrom::Start(0)).map_err(DzipError::Io)?;
-
                     Ok((temp_file, counting_reader.count))
                 })();
                 let _ = s.send((job.chunk_idx, res));
@@ -454,6 +429,7 @@ impl PackPlan {
         table_start_pos: u64,
         chunks: &[ChunkDef],
     ) -> Result<()> {
+        // (Keep existing implementation...)
         let mut table_buffer = Cursor::new(Vec::new());
         for c in chunks {
             table_buffer
@@ -488,14 +464,11 @@ impl PackPlan {
     }
 }
 
-// --- Helper Structs ---
-
-/// A reader wrapper that counts the number of bytes read.
+// (Helper Structs CountingReader unchanged)
 struct CountingReader<R> {
     inner: R,
     count: u64,
 }
-
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;

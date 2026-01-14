@@ -3,7 +3,7 @@ use log::{info, warn};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::codecs::decompress;
@@ -13,10 +13,10 @@ use crate::format::{
 };
 use crate::io::{ReadSeekSend, UnpackSink, UnpackSource};
 use crate::model::{ArchiveMeta, ChunkDef, Config, FileEntry, RangeSettings};
-use crate::utils::{decode_flags, read_null_term_string};
+use crate::utils::{decode_flags, read_null_term_string, to_native_path}; // Changed import
 
 // --- Structures ---
-
+// (Keep ArchiveMetadata, UnpackPlan, FileMapEntry, RawChunk definitions as is)
 #[derive(Debug)]
 pub struct ArchiveMetadata {
     pub version: u8,
@@ -54,8 +54,6 @@ pub struct RawChunk {
 
 // --- Wrapper ---
 
-/// Main entry point for unpacking.
-/// Uses `&dyn UnpackSink` to allow parallel file creation (thread-safe).
 pub fn do_unpack(
     source: &dyn UnpackSource,
     sink: &dyn UnpackSink,
@@ -72,8 +70,7 @@ pub fn do_unpack(
 // --- Implementations ---
 
 impl ArchiveMetadata {
-    /// Loads the archive metadata from the main source file.
-    /// This method has been refactored to use smaller helper functions for better readability.
+    // (Keep load, read_header_basic, read_file_names, etc. as is)
     pub fn load(source: &dyn UnpackSource) -> Result<Self> {
         let mut main_file_raw = source.open_main()?;
         let main_file_len = main_file_raw
@@ -84,26 +81,12 @@ impl ArchiveMetadata {
             .map_err(DzipError::Io)?;
 
         let mut reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, main_file_raw);
-
-        // 1. Read Basic Header
         let (version, num_files, num_dirs) = Self::read_header_basic(&mut reader)?;
-
-        // 2. Read File Names
         let user_files = Self::read_file_names(&mut reader, num_files)?;
-
-        // 3. Read Directories
         let directories = Self::read_directories(&mut reader, num_dirs)?;
-
-        // 4. Read File-Chunk Maps
         let map_entries = Self::read_file_maps(&mut reader, num_files)?;
-
-        // 5. Read Chunk Table
         let (raw_chunks, num_arch_files, has_dz_chunk) = Self::read_chunk_table(&mut reader)?;
-
-        // 6. Read Split Filenames (if any)
         let split_file_names = Self::read_split_filenames(&mut reader, num_arch_files)?;
-
-        // 7. Read Range Settings (if needed)
         let range_settings = Self::read_range_settings(&mut reader, has_dz_chunk)?;
 
         Ok(Self {
@@ -117,8 +100,6 @@ impl ArchiveMetadata {
             main_file_len,
         })
     }
-
-    // --- Helper Methods for Loading ---
 
     fn read_header_basic<R: Read>(reader: &mut R) -> Result<(u8, u16, u16)> {
         let magic = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
@@ -146,11 +127,8 @@ impl ArchiveMetadata {
 
     fn read_directories<R: std::io::BufRead>(reader: &mut R, count: u16) -> Result<Vec<String>> {
         let mut dirs = Vec::with_capacity(count as usize);
-        // The first directory is always logically current dir "."
         dirs.push(CURRENT_DIR_STR.to_string());
         for _ in 0..(count - 1) {
-            // We read the raw string as-is (e.g., "textures\ui").
-            // The CLI/Sink is responsible for OS adaptation.
             dirs.push(read_null_term_string(reader).map_err(DzipError::Io)?);
         }
         Ok(dirs)
@@ -184,22 +162,18 @@ impl ArchiveMetadata {
             "Chunk Settings: {} chunks in {} archive files",
             num_chunks, num_arch_files
         );
-
         let mut chunks = Vec::with_capacity(num_chunks as usize);
         let mut has_dz_chunk = false;
-
         for i in 0..num_chunks {
             let offset = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let c_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let d_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let flags_raw = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
             let file_idx = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
-
             let flags = ChunkFlags::from_bits_truncate(flags_raw);
             if flags.contains(ChunkFlags::DZ_RANGE) {
                 has_dz_chunk = true;
             }
-
             chunks.push(RawChunk {
                 id: i,
                 offset,
@@ -210,7 +184,6 @@ impl ArchiveMetadata {
                 real_c_len: 0,
             });
         }
-
         Ok((chunks, num_arch_files, has_dz_chunk))
     }
 
@@ -271,7 +244,6 @@ impl UnpackPlan {
         for (idx, c) in chunks.iter().enumerate() {
             file_chunks_map.entry(c.file_idx).or_default().push(idx);
         }
-
         for (f_idx, c_indices) in file_chunks_map.iter() {
             let mut sorted_indices = c_indices.clone();
             sorted_indices.sort_by_key(|&i| chunks[i].offset);
@@ -284,7 +256,6 @@ impl UnpackPlan {
                 })?;
                 source.get_split_len(split_name)?
             };
-
             for k in 0..sorted_indices.len() {
                 let idx = sorted_indices[k];
                 let current_offset = chunks[idx].offset;
@@ -327,7 +298,6 @@ impl UnpackPlan {
                     CURRENT_DIR_STR
                 };
 
-                // [Refactor] Use PathBuf for robust path construction
                 let mut path_buf = PathBuf::from(raw_dir);
                 if raw_dir != CURRENT_DIR_STR && !raw_dir.is_empty() {
                     path_buf.push(fname);
@@ -335,17 +305,15 @@ impl UnpackPlan {
                     path_buf = PathBuf::from(fname);
                 }
 
-                // Convert back to string for the Sink interface (which expects relative path string)
-                // We use to_string_lossy() to handle potential non-UTF8 paths gracefully,
-                // though the archive format enforces UTF-8 strings generally.
-                let rel_path = path_buf.to_string_lossy().replace('\\', "/");
+                // [Changed] Use to_native_path so Sink receives OS-specific paths.
+                let rel_path = to_native_path(&path_buf);
 
-                // [Refactor] Fix Clippy collapsible_if warning using Option::filter
                 if let Some(parent) = path_buf
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty() && p.as_os_str() != ".")
                 {
-                    sink.create_dir_all(&parent.to_string_lossy())?;
+                    // [Changed] Create directories using native paths
+                    sink.create_dir_all(&to_native_path(parent))?;
                 }
 
                 let out_file = sink.create_file(&rel_path)?;
@@ -419,7 +387,6 @@ impl UnpackPlan {
             } else {
                 CURRENT_DIR_STR
             };
-
             let mut path_buf = PathBuf::from(raw_dir);
             if raw_dir != CURRENT_DIR_STR && !raw_dir.is_empty() {
                 path_buf.push(fname);
@@ -427,21 +394,22 @@ impl UnpackPlan {
                 path_buf = PathBuf::from(fname);
             }
 
-            // Normalize separators to forward slash for the TOML config standard
-            let full_raw_path = path_buf.to_string_lossy().replace('\\', "/");
+            // [Changed] Use to_native_path so the TOML file contains OS-specific paths.
+            // On Windows this will contain backslashes, on macOS forward slashes.
+            let full_raw_path = to_native_path(&path_buf);
+            let normalized_dir = to_native_path(Path::new(raw_dir));
 
             toml_files.push(FileEntry {
                 path: full_raw_path,
-                directory: raw_dir.to_string(),
+                directory: normalized_dir,
                 filename: fname.clone(),
                 chunks: entry.chunk_ids.clone(),
             });
         }
-
+        // (Chunk generation code unchanged)
         let mut toml_chunks = Vec::new();
         let mut sorted_chunks = self.processed_chunks.clone();
         sorted_chunks.sort_by_key(|c| c.id);
-
         for c in sorted_chunks {
             let flags_list = decode_flags(c.flags)
                 .into_iter()
@@ -456,7 +424,6 @@ impl UnpackPlan {
                 archive_file_index: c.file_idx,
             });
         }
-
         Ok(Config {
             archive: ArchiveMeta {
                 version: self.metadata.version,
