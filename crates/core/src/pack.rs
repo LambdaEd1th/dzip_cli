@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::mpsc;
+use tempfile::NamedTempFile;
 
 use crate::Result;
 use crate::codecs::compress;
@@ -318,7 +319,11 @@ impl PackPlan {
             .collect();
         let jobs = jobs?;
         let channel_bound = rayon::current_num_threads() * 4;
-        let (tx, rx) = mpsc::sync_channel::<(usize, Result<Vec<u8>>)>(channel_bound);
+
+        // [Refactor] Change Channel Type:
+        // Pass (NamedTempFile, u64) instead of Vec<u8> to support large files via disk buffer.
+        let (tx, rx) = mpsc::sync_channel::<(usize, Result<(NamedTempFile, u64)>)>(channel_bound);
+
         let mut current_offset_0 = start_offset_0;
         let mut split_offsets_owned: HashMap<u16, u32> =
             split_writers.keys().map(|k| (*k, 0)).collect();
@@ -326,10 +331,12 @@ impl PackPlan {
         std::thread::scope(|s| {
             let writer_handle = s.spawn(move || -> Result<PipelineOutput> {
                 let total_chunks = sorted_chunks_def.len();
-                let mut buffer: HashMap<usize, Vec<u8>> = HashMap::new();
+
+                // [Refactor] Buffer now holds TempFiles.
+                let mut buffer: HashMap<usize, (NamedTempFile, u64)> = HashMap::new();
                 let mut next_idx = 0;
                 while next_idx < total_chunks {
-                    let data = if let Some(d) = buffer.remove(&next_idx) {
+                    let (mut temp_file, actual_d_len) = if let Some(d) = buffer.remove(&next_idx) {
                         d
                     } else {
                         match rx.recv() {
@@ -369,14 +376,21 @@ impl PackPlan {
                             .get(&c_def.archive_file_index)
                             .unwrap_or(&0) // Safe: initialized from keys above
                     };
-                    target_writer.write_all(&data).map_err(DzipError::Io)?;
+
+                    // [Refactor] Stream copy from temp file to final archive.
+                    // This avoids loading the whole chunk into RAM.
+                    let compressed_size =
+                        std::io::copy(&mut temp_file, target_writer).map_err(DzipError::Io)?;
+
                     c_def.offset = current_pos;
-                    c_def.size_compressed = data.len() as u32;
+                    c_def.size_compressed = compressed_size as u32;
+
+                    // [Fix 1] Ensure metadata correctness with actual read size
+                    c_def.size_decompressed = actual_d_len as u32;
 
                     if c_def.archive_file_index == 0 {
                         current_offset_0 += c_def.size_compressed;
                     } else {
-                        // Replaced unwrap() with proper error handling
                         let offset = split_offsets_owned
                             .get_mut(&c_def.archive_file_index)
                             .ok_or_else(|| {
@@ -394,22 +408,38 @@ impl PackPlan {
                 }
                 Ok((sorted_chunks_def, writer0))
             });
+
             jobs.par_iter().for_each_with(tx, |s, job| {
-                let res = (|| -> Result<Vec<u8>> {
+                // [Refactor] Return NamedTempFile
+                let res = (|| -> Result<(NamedTempFile, u64)> {
                     let mut f_in = source.open_file(&job.source_path)?;
                     f_in.seek(SeekFrom::Start(job.offset))
                         .map_err(DzipError::Io)?;
-                    let mut chunk_reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, f_in)
+                    let chunk_reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, f_in)
                         .take(job.read_len as u64);
-                    let mut compressed_buffer = Vec::new();
+
+                    let mut counting_reader = CountingReader {
+                        inner: chunk_reader,
+                        count: 0,
+                    };
+
+                    // [Refactor] Create a temporary file for compression output
+                    let mut temp_file = NamedTempFile::new().map_err(DzipError::Io)?;
+
                     let flags_cow: Vec<std::borrow::Cow<'_, str>> = job
                         .flags
                         .iter()
                         .map(|c| std::borrow::Cow::Borrowed(c.as_ref()))
                         .collect();
                     let flags_int = encode_flags(&flags_cow);
-                    compress(&mut chunk_reader, &mut compressed_buffer, flags_int)?;
-                    Ok(compressed_buffer)
+
+                    // Compress directly to the temporary file
+                    compress(&mut counting_reader, &mut temp_file, flags_int)?;
+
+                    // [Important] Rewind the temp file so the consumer can read it from the beginning
+                    temp_file.seek(SeekFrom::Start(0)).map_err(DzipError::Io)?;
+
+                    Ok((temp_file, counting_reader.count))
                 })();
                 let _ = s.send((job.chunk_idx, res));
             });
@@ -455,5 +485,21 @@ impl PackPlan {
             .map_err(DzipError::Io)?;
         writer.flush().map_err(DzipError::Io)?;
         Ok(())
+    }
+}
+
+// --- Helper Structs ---
+
+/// A reader wrapper that counts the number of bytes read.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
     }
 }

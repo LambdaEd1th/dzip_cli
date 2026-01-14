@@ -3,6 +3,7 @@ use log::{info, warn};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 use crate::Result;
 use crate::codecs::decompress;
@@ -71,6 +72,8 @@ pub fn do_unpack(
 // --- Implementations ---
 
 impl ArchiveMetadata {
+    /// Loads the archive metadata from the main source file.
+    /// This method has been refactored to use smaller helper functions for better readability.
     pub fn load(source: &dyn UnpackSource) -> Result<Self> {
         let mut main_file_raw = source.open_main()?;
         let main_file_len = main_file_raw
@@ -82,6 +85,42 @@ impl ArchiveMetadata {
 
         let mut reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, main_file_raw);
 
+        // 1. Read Basic Header
+        let (version, num_files, num_dirs) = Self::read_header_basic(&mut reader)?;
+
+        // 2. Read File Names
+        let user_files = Self::read_file_names(&mut reader, num_files)?;
+
+        // 3. Read Directories
+        let directories = Self::read_directories(&mut reader, num_dirs)?;
+
+        // 4. Read File-Chunk Maps
+        let map_entries = Self::read_file_maps(&mut reader, num_files)?;
+
+        // 5. Read Chunk Table
+        let (raw_chunks, num_arch_files, has_dz_chunk) = Self::read_chunk_table(&mut reader)?;
+
+        // 6. Read Split Filenames (if any)
+        let split_file_names = Self::read_split_filenames(&mut reader, num_arch_files)?;
+
+        // 7. Read Range Settings (if needed)
+        let range_settings = Self::read_range_settings(&mut reader, has_dz_chunk)?;
+
+        Ok(Self {
+            version,
+            user_files,
+            directories,
+            map_entries,
+            raw_chunks,
+            split_file_names,
+            range_settings,
+            main_file_len,
+        })
+    }
+
+    // --- Helper Methods for Loading ---
+
+    fn read_header_basic<R: Read>(reader: &mut R) -> Result<(u8, u16, u16)> {
         let magic = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
         if magic != MAGIC {
             return Err(DzipError::InvalidMagic(magic));
@@ -94,21 +133,32 @@ impl ArchiveMetadata {
             "Header: Ver {}, Files {}, Dirs {}",
             version, num_files, num_dirs
         );
+        Ok((version, num_files, num_dirs))
+    }
 
-        let mut user_files = Vec::with_capacity(num_files as usize);
-        for _ in 0..num_files {
-            user_files.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
+    fn read_file_names<R: std::io::BufRead>(reader: &mut R, count: u16) -> Result<Vec<String>> {
+        let mut files = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            files.push(read_null_term_string(reader).map_err(DzipError::Io)?);
         }
-        let mut directories = Vec::with_capacity(num_dirs as usize);
-        directories.push(CURRENT_DIR_STR.to_string());
-        for _ in 0..(num_dirs - 1) {
-            // [Reverted Logic] We read the raw string as-is (e.g., "textures\ui").
-            // We do NOT normalize to '/' here anymore. The CLI/Sink is responsible for OS adaptation.
-            directories.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
-        }
+        Ok(files)
+    }
 
-        let mut map_entries = Vec::with_capacity(num_files as usize);
-        for i in 0..num_files {
+    fn read_directories<R: std::io::BufRead>(reader: &mut R, count: u16) -> Result<Vec<String>> {
+        let mut dirs = Vec::with_capacity(count as usize);
+        // The first directory is always logically current dir "."
+        dirs.push(CURRENT_DIR_STR.to_string());
+        for _ in 0..(count - 1) {
+            // We read the raw string as-is (e.g., "textures\ui").
+            // The CLI/Sink is responsible for OS adaptation.
+            dirs.push(read_null_term_string(reader).map_err(DzipError::Io)?);
+        }
+        Ok(dirs)
+    }
+
+    fn read_file_maps<R: Read>(reader: &mut R, count: u16) -> Result<Vec<FileMapEntry>> {
+        let mut entries = Vec::with_capacity(count as usize);
+        for i in 0..count {
             let dir_id = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)? as usize;
             let mut chunk_ids = Vec::new();
             loop {
@@ -118,13 +168,16 @@ impl ArchiveMetadata {
                 }
                 chunk_ids.push(cid);
             }
-            map_entries.push(FileMapEntry {
+            entries.push(FileMapEntry {
                 id: i as usize,
                 dir_idx: dir_id,
                 chunk_ids,
             });
         }
+        Ok(entries)
+    }
 
+    fn read_chunk_table<R: Read>(reader: &mut R) -> Result<(Vec<RawChunk>, u16, bool)> {
         let num_arch_files = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
         let num_chunks = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
         info!(
@@ -132,19 +185,22 @@ impl ArchiveMetadata {
             num_chunks, num_arch_files
         );
 
-        let mut raw_chunks = Vec::with_capacity(num_chunks as usize);
+        let mut chunks = Vec::with_capacity(num_chunks as usize);
         let mut has_dz_chunk = false;
+
         for i in 0..num_chunks {
             let offset = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let c_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let d_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let flags_raw = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
             let file_idx = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
+
             let flags = ChunkFlags::from_bits_truncate(flags_raw);
             if flags.contains(ChunkFlags::DZ_RANGE) {
                 has_dz_chunk = true;
             }
-            raw_chunks.push(RawChunk {
+
+            chunks.push(RawChunk {
                 id: i,
                 offset,
                 _head_c_len: c_len,
@@ -155,18 +211,30 @@ impl ArchiveMetadata {
             });
         }
 
-        let mut split_file_names = Vec::new();
+        Ok((chunks, num_arch_files, has_dz_chunk))
+    }
+
+    fn read_split_filenames<R: std::io::BufRead>(
+        reader: &mut R,
+        num_arch_files: u16,
+    ) -> Result<Vec<String>> {
+        let mut names = Vec::new();
         if num_arch_files > 1 {
             info!("Reading {} split archive filenames...", num_arch_files - 1);
             for _ in 0..(num_arch_files - 1) {
-                split_file_names.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
+                names.push(read_null_term_string(reader).map_err(DzipError::Io)?);
             }
         }
+        Ok(names)
+    }
 
-        let mut range_settings = None;
+    fn read_range_settings<R: Read>(
+        reader: &mut R,
+        has_dz_chunk: bool,
+    ) -> Result<Option<RangeSettings>> {
         if has_dz_chunk {
             info!("Detected CHUNK_DZ, reading RangeSettings...");
-            range_settings = Some(RangeSettings {
+            let rs = RangeSettings {
                 win_size: reader.read_u8().map_err(DzipError::Io)?,
                 flags: reader.read_u8().map_err(DzipError::Io)?,
                 offset_table_size: reader.read_u8().map_err(DzipError::Io)?,
@@ -177,19 +245,11 @@ impl ArchiveMetadata {
                 ref_offset_table_size: reader.read_u8().map_err(DzipError::Io)?,
                 ref_offset_tables: reader.read_u8().map_err(DzipError::Io)?,
                 big_min_match: reader.read_u8().map_err(DzipError::Io)?,
-            });
+            };
+            Ok(Some(rs))
+        } else {
+            Ok(None)
         }
-
-        Ok(Self {
-            version,
-            user_files,
-            directories,
-            map_entries,
-            raw_chunks,
-            split_file_names,
-            range_settings,
-            main_file_len,
-        })
     }
 }
 
@@ -266,18 +326,26 @@ impl UnpackPlan {
                 } else {
                     CURRENT_DIR_STR
                 };
-                // Construct the relative path. Note: `raw_dir` might contain '\' or '/'.
-                // We pass this raw path to the Sink, which must handle normalization.
-                let rel_path = if raw_dir == CURRENT_DIR_STR || raw_dir.is_empty() {
-                    fname.clone()
-                } else {
-                    format!("{}/{}", raw_dir, fname)
-                };
 
-                // Create directory structure via sink
-                // Note: We scan for both separators to find the parent directory
-                if let Some(last_slash) = rel_path.rfind('/').or_else(|| rel_path.rfind('\\')) {
-                    sink.create_dir_all(&rel_path[..last_slash])?;
+                // [Refactor] Use PathBuf for robust path construction
+                let mut path_buf = PathBuf::from(raw_dir);
+                if raw_dir != CURRENT_DIR_STR && !raw_dir.is_empty() {
+                    path_buf.push(fname);
+                } else {
+                    path_buf = PathBuf::from(fname);
+                }
+
+                // Convert back to string for the Sink interface (which expects relative path string)
+                // We use to_string_lossy() to handle potential non-UTF8 paths gracefully,
+                // though the archive format enforces UTF-8 strings generally.
+                let rel_path = path_buf.to_string_lossy().replace('\\', "/");
+
+                // [Refactor] Fix Clippy collapsible_if warning using Option::filter
+                if let Some(parent) = path_buf
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty() && p.as_os_str() != ".")
+                {
+                    sink.create_dir_all(&parent.to_string_lossy())?;
                 }
 
                 let out_file = sink.create_file(&rel_path)?;
@@ -352,11 +420,15 @@ impl UnpackPlan {
                 CURRENT_DIR_STR
             };
 
-            let full_raw_path = if raw_dir == CURRENT_DIR_STR || raw_dir.is_empty() {
-                fname.clone()
+            let mut path_buf = PathBuf::from(raw_dir);
+            if raw_dir != CURRENT_DIR_STR && !raw_dir.is_empty() {
+                path_buf.push(fname);
             } else {
-                format!("{}/{}", raw_dir, fname)
-            };
+                path_buf = PathBuf::from(fname);
+            }
+
+            // Normalize separators to forward slash for the TOML config standard
+            let full_raw_path = path_buf.to_string_lossy().replace('\\', "/");
 
             toml_files.push(FileEntry {
                 path: full_raw_path,
