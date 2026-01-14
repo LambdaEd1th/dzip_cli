@@ -9,8 +9,8 @@ use std::path::Path;
 use args::{Cli, Commands};
 use fs::{FsPackSink, FsPackSource, FsUnpackSink, FsUnpackSource};
 
-use dzip_core::{Result, do_list, do_pack, do_unpack, model::Config};
 use dzip_core::utils::to_native_path;
+use dzip_core::{Result, do_list, do_pack, do_unpack, model::Config};
 
 fn main() {
     let cli = Cli::parse();
