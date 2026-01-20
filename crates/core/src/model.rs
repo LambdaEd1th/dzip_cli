@@ -29,7 +29,7 @@ pub struct FileEntry {
     pub chunk: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkDef {
     pub id: u16,
     pub offset: u32,

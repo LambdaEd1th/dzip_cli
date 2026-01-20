@@ -101,6 +101,14 @@ impl PackPlan {
                 c_def.size_decompressed
             } as usize;
 
+            if read_len == 0 {
+                log::warn!(
+                    "Chunk {} has size 0. This may result in empty output. \
+                     Consider setting size_decompressed in the config.",
+                    cid
+                );
+            }
+
             chunk_source_map.insert(cid, (os_path_str.clone(), current_offset, read_len));
         }
 

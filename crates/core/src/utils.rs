@@ -94,3 +94,70 @@ pub fn to_archive_path(path: &Path) -> String {
     // regardless of the OS this tool is running on.
     parts.join("\\")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn test_encode_flags_single() {
+        let flags = vec![Cow::Borrowed("LZMA")];
+        assert_eq!(encode_flags(&flags), ChunkFlags::LZMA.bits());
+    }
+
+    #[test]
+    fn test_encode_flags_multiple() {
+        let flags = vec![Cow::Borrowed("ZLIB"), Cow::Borrowed("COMBUF")];
+        let expected = ChunkFlags::ZLIB.bits() | ChunkFlags::COMBUF.bits();
+        assert_eq!(encode_flags(&flags), expected);
+    }
+
+    #[test]
+    fn test_encode_flags_empty() {
+        let flags: Vec<Cow<'_, str>> = vec![];
+        assert_eq!(encode_flags(&flags), 0);
+    }
+
+    #[test]
+    fn test_decode_flags_single() {
+        let bits = ChunkFlags::LZMA.bits();
+        let decoded = decode_flags(bits);
+        assert_eq!(decoded, vec![Cow::Borrowed("LZMA")]);
+    }
+
+    #[test]
+    fn test_decode_flags_multiple() {
+        let bits = ChunkFlags::ZLIB.bits() | ChunkFlags::BZIP.bits();
+        let decoded = decode_flags(bits);
+        assert!(decoded.contains(&Cow::Borrowed("ZLIB")));
+        assert!(decoded.contains(&Cow::Borrowed("BZIP")));
+    }
+
+    #[test]
+    fn test_to_native_path_simple() {
+        let path = Path::new("a/b/c");
+        let result = to_native_path(path);
+        #[cfg(unix)]
+        assert_eq!(result, "a/b/c");
+        #[cfg(windows)]
+        assert_eq!(result, "a\\b\\c");
+    }
+
+    #[test]
+    fn test_to_archive_path_simple() {
+        let path = Path::new("a/b/c");
+        let result = to_archive_path(path);
+        assert_eq!(result, "a\\b\\c");
+    }
+
+    #[test]
+    fn test_roundtrip_flags() {
+        let original = vec![Cow::Borrowed("LZMA"), Cow::Borrowed("COMBUF")];
+        let encoded = encode_flags(&original);
+        let decoded = decode_flags(encoded);
+        for flag in &original {
+            assert!(decoded.contains(flag));
+        }
+    }
+}

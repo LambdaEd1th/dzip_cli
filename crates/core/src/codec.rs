@@ -83,3 +83,62 @@ pub fn decompress(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::ChunkFlags;
+    use std::io::Cursor;
+
+    fn roundtrip_test(flags: u16, data: &[u8]) {
+        let mut compressed = Vec::new();
+        compress(&mut Cursor::new(data), &mut compressed, flags).unwrap();
+
+        let mut decompressed = Vec::new();
+        decompress(
+            &mut Cursor::new(&compressed),
+            &mut decompressed,
+            flags,
+            compressed.len() as u32,
+        )
+        .unwrap();
+
+        assert_eq!(data, decompressed.as_slice());
+    }
+
+    #[test]
+    fn test_store_roundtrip() {
+        let data = b"Hello, World! This is uncompressed data.";
+        roundtrip_test(0, data); // 0 flags = store/copy
+    }
+
+    #[test]
+    fn test_zlib_roundtrip() {
+        let data = b"Hello, World! This is ZLIB compressed data.";
+        roundtrip_test(ChunkFlags::ZLIB.bits(), data);
+    }
+
+    #[test]
+    fn test_lzma_roundtrip() {
+        let data = b"Hello, World! This is LZMA compressed data.";
+        roundtrip_test(ChunkFlags::LZMA.bits(), data);
+    }
+
+    #[test]
+    fn test_bzip_roundtrip() {
+        let data = b"Hello, World! This is BZIP2 compressed data.";
+        roundtrip_test(ChunkFlags::BZIP.bits(), data);
+    }
+
+    #[test]
+    fn test_empty_data() {
+        let data = b"";
+        roundtrip_test(ChunkFlags::ZLIB.bits(), data);
+    }
+
+    #[test]
+    fn test_large_data() {
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        roundtrip_test(ChunkFlags::ZLIB.bits(), &data);
+    }
+}
