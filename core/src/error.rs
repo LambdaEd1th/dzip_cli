@@ -17,6 +17,12 @@ pub enum DzipError {
 
     #[error("Unsupported compression method: flags={0:#x}")]
     UnsupportedCompression(u16),
+
+    #[error("Volume {0} not found in file list")]
+    VolumeNotFound(u16),
+
+    #[error("Failed to open volume {0}: {1}")]
+    VolumeOpenError(u16, String),
 }
 
 pub type Result<T> = std::result::Result<T, DzipError>;

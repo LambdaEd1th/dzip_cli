@@ -1,15 +1,17 @@
 use crate::error::{DzipError, Result};
 use crate::format::*;
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::{Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek};
 
 pub struct DzipReader<R: Read + Seek> {
-    reader: R,
+    reader: BufReader<R>,
 }
 
 impl<R: Read + Seek> DzipReader<R> {
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader: BufReader::new(reader),
+        }
     }
 
     pub fn read_archive_settings(&mut self) -> Result<ArchiveSettings> {
@@ -52,12 +54,9 @@ impl<R: Read + Seek> DzipReader<R> {
 
     fn read_null_terminated_string(&mut self) -> Result<String> {
         let mut bytes = Vec::new();
-        loop {
-            let byte = self.reader.read_u8()?;
-            if byte == 0 {
-                break;
-            }
-            bytes.push(byte);
+        let _ = self.reader.read_until(0, &mut bytes)?;
+        if bytes.last() == Some(&0) {
+            bytes.pop();
         }
         Ok(String::from_utf8(bytes)?)
     }

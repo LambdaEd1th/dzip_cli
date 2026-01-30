@@ -97,7 +97,8 @@ pub fn parse_config(path: &Path) -> Result<DzipConfig> {
             "file" => {
                 // file <path> <index> <algo> [modifiers...]
                 if parts.len() >= 4 {
-                    let path = PathBuf::from(parts[1].replace('\\', "/"));
+                    let path = dzip_core::path::resolve_relative_path(parts[1])
+                        .context("Failed to resolve file path")?;
                     let idx = parts[2]
                         .parse::<u16>()
                         .context("Failed to parse archive index")?;

@@ -42,10 +42,7 @@ impl VolumeSource for FileSystemVolumeManager {
 
         let list_index = (id - 1) as usize;
         if list_index >= self.file_list.len() {
-            return Err(DzipError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Volume ID {} not found in file list", id),
-            )));
+            return Err(DzipError::VolumeNotFound(id));
         }
 
         match self.open_files.entry(id) {
@@ -54,7 +51,8 @@ impl VolumeSource for FileSystemVolumeManager {
                 let file_name = &self.file_list[list_index];
                 let path = self.base_dir.join(file_name);
                 log::debug!("Opening volume {}: {}", id, path.display());
-                let file = File::open(&path)?;
+                let file =
+                    File::open(&path).map_err(|e| DzipError::VolumeOpenError(id, e.to_string()))?;
                 Ok(e.insert(file))
             }
         }
